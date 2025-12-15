@@ -4,6 +4,7 @@ import type {
   OpenRouterEndpoint,
   Task2ModelResult,
   ShortlistEntry,
+  ShortlistEntryMinimal,
   RequestSkeleton,
   EndpointsSummary,
   ExcludedSummary,
@@ -45,6 +46,26 @@ function parsePrice(priceStr: string | undefined): number {
   if (!priceStr) return Infinity;
   const val = parseFloat(priceStr);
   return isNaN(val) ? Infinity : val * 1_000_000; // Convert per-token to per-1M
+}
+
+// Calculate model age in days
+function getModelAgeDays(model: OpenRouterModel): number {
+  if (!model.created) return Infinity; // Unknown age treated as very old
+  const now = Date.now();
+  const createdMs = model.created * 1000; // Convert Unix timestamp to ms
+  return Math.floor((now - createdMs) / (1000 * 60 * 60 * 24));
+}
+
+// Check if model is free (both prompt and completion are 0)
+function isFreeModel(model: OpenRouterModel): boolean {
+  const promptPrice = parseFloat(model.pricing.prompt || '0');
+  const completionPrice = parseFloat(model.pricing.completion || '0');
+  return promptPrice === 0 && completionPrice === 0;
+}
+
+// Extract provider from model ID (e.g., "anthropic/claude-3" -> "anthropic")
+function getProvider(modelId: string): string {
+  return modelId.split('/')[0]?.toLowerCase() || '';
 }
 
 // Check if model meets hard constraints
@@ -113,6 +134,31 @@ function meetsHardConstraints(
     const missingParams = constraints.required_parameters.filter(p => !supportedParams.has(p));
     if (missingParams.length > 0) {
       exclusionReasons.set('missing_required_parameters', (exclusionReasons.get('missing_required_parameters') || 0) + 1);
+      return false;
+    }
+  }
+
+  // Check minimum age (exclude new/untested models)
+  if (constraints.min_age_days !== undefined) {
+    const ageDays = getModelAgeDays(model);
+    if (ageDays < constraints.min_age_days) {
+      exclusionReasons.set('too_new', (exclusionReasons.get('too_new') || 0) + 1);
+      return false;
+    }
+  }
+
+  // Check exclude free models
+  if (constraints.exclude_free && isFreeModel(model)) {
+    exclusionReasons.set('free_model', (exclusionReasons.get('free_model') || 0) + 1);
+    return false;
+  }
+
+  // Check provider whitelist
+  if (constraints.providers && constraints.providers.length > 0) {
+    const modelProvider = getProvider(model.id);
+    const allowedProviders = constraints.providers.map(p => p.toLowerCase());
+    if (!allowedProviders.includes(modelProvider)) {
+      exclusionReasons.set('provider_not_allowed', (exclusionReasons.get('provider_not_allowed') || 0) + 1);
       return false;
     }
   }
@@ -290,12 +336,27 @@ async function checkEndpoints(
   };
 }
 
+// Build minimal format entry
+function buildMinimalEntry(model: OpenRouterModel): ShortlistEntryMinimal {
+  const promptPrice = parseFloat(model.pricing.prompt || '0') * 1_000_000;
+  const completionPrice = parseFloat(model.pricing.completion || '0') * 1_000_000;
+  return {
+    model_id: model.id,
+    name: model.name,
+    price: { prompt: promptPrice, completion: completionPrice },
+    context: model.context_length,
+    supports: model.supported_parameters || [],
+    age_days: getModelAgeDays(model),
+  };
+}
+
 // Main task2model function
 export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const forceRefresh = spec.result?.force_refresh ?? false;
   const limit = spec.result?.limit ?? 8;
   const includeEndpoints = spec.result?.include_endpoints ?? false;
   const includeRequestSkeleton = spec.result?.include_request_skeleton ?? true;
+  const detailLevel = spec.result?.detail ?? 'standard';
   const requiredParams = spec.hard_constraints?.required_parameters;
 
   // Freshness gate: ensure cache is valid
@@ -336,49 +397,61 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   // Take top N
   const shortlisted = sorted.slice(0, limit);
 
-  // Build shortlist entries
-  const shortlist: ShortlistEntry[] = await Promise.all(
-    shortlisted.map(async model => {
-      const modalities = parseModalities(model);
-      const reasons = generateReasons(model, spec.hard_constraints);
-      const risks: string[] = [];
+  // Build shortlist entries based on detail level
+  let shortlist: (ShortlistEntry | ShortlistEntryMinimal | OpenRouterModel)[];
 
-      // Check endpoints if requested
-      const endpointCheck = await checkEndpoints(model.id, requiredParams, includeEndpoints);
-      if (endpointCheck.risk) {
-        risks.push(endpointCheck.risk);
-      }
+  if (detailLevel === 'minimal') {
+    // Minimal: compact format, no async operations
+    shortlist = shortlisted.map(model => buildMinimalEntry(model));
+  } else if (detailLevel === 'full') {
+    // Full: return raw OpenRouter model data
+    shortlist = shortlisted.map(model => model);
+  } else {
+    // Standard: default format with reasons and optional extras
+    shortlist = await Promise.all(
+      shortlisted.map(async model => {
+        const modalities = parseModalities(model);
+        const reasons = generateReasons(model, spec.hard_constraints);
+        const risks: string[] = [];
 
-      const entry: ShortlistEntry = {
-        model_id: model.id,
-        name: model.name,
-        created: model.created,
-        context_length: model.context_length,
-        pricing: {
-          prompt: model.pricing.prompt,
-          completion: model.pricing.completion,
-          request: model.pricing.request,
-        },
-        modalities: {
-          input: modalities.input,
-          output: modalities.output,
-        },
-        supported_parameters: model.supported_parameters,
-        why_selected: reasons,
-        risks: risks.length > 0 ? risks : undefined,
-      };
+        // Check endpoints if requested
+        const endpointCheck = await checkEndpoints(model.id, requiredParams, includeEndpoints);
+        if (endpointCheck.risk) {
+          risks.push(endpointCheck.risk);
+        }
 
-      if (includeRequestSkeleton) {
-        entry.request_skeleton = generateSkeleton(model, allModels, spec.preferences, requiredParams);
-      }
+        const entry: ShortlistEntry = {
+          model_id: model.id,
+          name: model.name,
+          created: model.created,
+          context_length: model.context_length,
+          age_days: getModelAgeDays(model),
+          pricing: {
+            prompt: model.pricing.prompt,
+            completion: model.pricing.completion,
+            request: model.pricing.request,
+          },
+          modalities: {
+            input: modalities.input,
+            output: modalities.output,
+          },
+          supported_parameters: model.supported_parameters,
+          why_selected: reasons,
+          risks: risks.length > 0 ? risks : undefined,
+        };
 
-      if (endpointCheck.summary) {
-        entry.endpoints_summary = endpointCheck.summary;
-      }
+        if (includeRequestSkeleton) {
+          entry.request_skeleton = generateSkeleton(model, allModels, spec.preferences, requiredParams);
+        }
 
-      return entry;
-    })
-  );
+        if (endpointCheck.summary) {
+          entry.endpoints_summary = endpointCheck.summary;
+        }
+
+        return entry;
+      })
+    );
+  }
 
   const excludedSummary: ExcludedSummary = {
     total_models: totalModels,

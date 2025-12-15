@@ -17,6 +17,10 @@ const HardConstraintsSchema = z.object({
   output_modalities: z.array(ModalitySchema).optional(),
   required_parameters: z.array(z.string()).optional(),
   max_price: MaxPriceSchema.optional(),
+  // New filters for quality/reliability
+  min_age_days: z.number().int().nonnegative().optional(),  // Exclude models < N days old
+  exclude_free: z.boolean().optional(),                      // Skip $0 pricing models
+  providers: z.array(z.string()).optional(),                 // Whitelist providers e.g. ["anthropic", "openai"]
 }).strict();
 
 // Preferences for sorting/routing
@@ -34,6 +38,7 @@ const ResultConfigSchema = z.object({
   include_parameters: z.boolean().default(false),
   include_request_skeleton: z.boolean().default(true),
   force_refresh: z.boolean().default(false),
+  detail: z.enum(['minimal', 'standard', 'full']).default('standard'),  // Output verbosity
 }).strict();
 
 // Main TaskSpec schema
@@ -96,12 +101,23 @@ export interface OpenRouterEndpoint {
   quantization?: string;
 }
 
-// Result types
+// Result types - minimal format (detail: "minimal")
+export interface ShortlistEntryMinimal {
+  model_id: string;
+  name: string;
+  price: { prompt: number; completion: number };  // Per 1M tokens
+  context: number;
+  supports: string[];
+  age_days: number;
+}
+
+// Result types - standard format (detail: "standard", default)
 export interface ShortlistEntry {
   model_id: string;
   name?: string;
   created?: number;
   context_length?: number;
+  age_days?: number;
   pricing?: {
     prompt: string;
     completion: string;
@@ -152,7 +168,7 @@ export interface CatalogInfo {
 
 export interface Task2ModelResult {
   task: string;
-  shortlist: ShortlistEntry[];
+  shortlist: (ShortlistEntry | ShortlistEntryMinimal | OpenRouterModel)[];
   excluded_summary: ExcludedSummary;
   catalog: CatalogInfo;
 }

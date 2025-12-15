@@ -1,6 +1,6 @@
 {
   "name": "openrouter-task2model",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP Server for OpenRouter model selection - filters models by TaskSpec constraints and generates request skeletons",
   "type": "module",
   "main": "dist/index.js",
@@ -15,8 +15,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc --watch",
-    "prepublishOnly": "npm run build"
+    "dev": "tsc --watch"
   },
   "keywords": [
     "openrouter",
