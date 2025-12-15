@@ -353,10 +353,10 @@ function buildMinimalEntry(model: OpenRouterModel): ShortlistEntryMinimal {
 // Main task2model function
 export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const forceRefresh = spec.result?.force_refresh ?? false;
-  const limit = spec.result?.limit ?? 8;
+  const limit = spec.result?.limit ?? 50;
   const includeEndpoints = spec.result?.include_endpoints ?? false;
-  const includeRequestSkeleton = spec.result?.include_request_skeleton ?? true;
-  const detailLevel = spec.result?.detail ?? 'standard';
+  const includeRequestSkeleton = spec.result?.include_request_skeleton ?? false;
+  const detailLevel = spec.result?.detail ?? 'minimal';
   const requiredParams = spec.hard_constraints?.required_parameters;
 
   // Freshness gate: ensure cache is valid

@@ -220,12 +220,12 @@ type TaskSpec = {
 
   // Result configuration
   result?: {
-    limit?: number;                      // default: 8
+    limit?: number;                      // default: 50 (for initial scan)
     include_endpoints?: boolean;         // default: false
     include_parameters?: boolean;        // default: false
-    include_request_skeleton?: boolean;  // default: true
+    include_request_skeleton?: boolean;  // default: false
     force_refresh?: boolean;             // default: false
-    detail?: "minimal"|"standard"|"full"; // default: "standard" - output verbosity
+    detail?: "minimal"|"standard"|"full"; // default: "minimal" - start with quick scan
   };
 };
 ```

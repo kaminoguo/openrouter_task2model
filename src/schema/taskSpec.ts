@@ -33,12 +33,12 @@ const PreferencesSchema = z.object({
 
 // Result configuration
 const ResultConfigSchema = z.object({
-  limit: z.number().int().positive().default(8),
+  limit: z.number().int().positive().default(50),  // Default higher for initial scan
   include_endpoints: z.boolean().default(false),
   include_parameters: z.boolean().default(false),
-  include_request_skeleton: z.boolean().default(true),
+  include_request_skeleton: z.boolean().default(false),  // Off by default for minimal scans
   force_refresh: z.boolean().default(false),
-  detail: z.enum(['minimal', 'standard', 'full']).default('standard'),  // Output verbosity
+  detail: z.enum(['minimal', 'standard', 'full']).default('minimal'),  // Start with minimal scan
 }).strict();
 
 // Main TaskSpec schema
