@@ -10,17 +10,31 @@ const MaxPriceSchema = z.object({
   request: z.number().optional(),
 }).strict();
 
-// Hard constraints for filtering
+// Hard constraints - TRUE dealbreakers only (binary pass/fail)
 const HardConstraintsSchema = z.object({
-  min_context_length: z.number().int().positive().optional(),
-  input_modalities: z.array(ModalitySchema).optional(),
-  output_modalities: z.array(ModalitySchema).optional(),
-  required_parameters: z.array(z.string()).optional(),
-  max_price: MaxPriceSchema.optional(),
-  // New filters for quality/reliability
-  min_age_days: z.number().int().nonnegative().optional(),  // Exclude models < N days old
-  exclude_free: z.boolean().optional(),                      // Skip $0 pricing models
-  providers: z.array(z.string()).optional(),                 // Whitelist providers e.g. ["anthropic", "openai"]
+  // These are true dealbreakers - model is excluded if not met
+  required_parameters: z.array(z.string()).optional(),  // Must support these (e.g., ["tools"])
+  input_modalities: z.array(ModalitySchema).optional(), // Must support these inputs
+  output_modalities: z.array(ModalitySchema).optional(),// Must support these outputs
+  providers: z.array(z.string()).optional(),            // Must be from these providers
+  exclude_free: z.boolean().optional(),                 // Exclude $0 models
+}).strict();
+
+// Soft constraints - contribute to scoring (not binary exclusion)
+const SoftConstraintsSchema = z.object({
+  target_context_length: z.number().int().positive().optional(), // Ideal context length
+  target_price: MaxPriceSchema.optional(),                        // Ideal price (scores degrade above)
+  prefer_mature: z.boolean().default(true),                       // Prefer models > 30 days old
+  min_age_days: z.number().int().nonnegative().optional(),        // Soft penalty for newer models
+}).strict();
+
+// Scoring weights - how much each factor matters (0-1, should sum to ~1)
+const ScoringWeightsSchema = z.object({
+  semantic: z.number().min(0).max(1).default(0.35),   // Task↔description similarity
+  price: z.number().min(0).max(1).default(0.20),      // Lower price = higher score
+  parameters: z.number().min(0).max(1).default(0.25),  // Required param coverage
+  recency: z.number().min(0).max(1).default(0.10),    // Newer = higher (if prefer_newer)
+  context: z.number().min(0).max(1).default(0.10),    // Context length fit
 }).strict();
 
 // Preferences for sorting/routing
@@ -29,6 +43,8 @@ const PreferencesSchema = z.object({
   routing: z.enum(['price', 'throughput', 'latency']).default('price'),
   prefer_exacto_for_tools: z.boolean().default(true),
   top_provider_only: z.boolean().default(false),
+  use_semantic_search: z.boolean().default(true),  // Enable embedding-based matching
+  scoring_weights: ScoringWeightsSchema.optional(),
 }).strict();
 
 // Result configuration
@@ -45,12 +61,15 @@ const ResultConfigSchema = z.object({
 export const TaskSpecSchema = z.object({
   task: z.string().min(1, 'Task description is required'),
   hard_constraints: HardConstraintsSchema.optional(),
+  soft_constraints: SoftConstraintsSchema.optional(),
   preferences: PreferencesSchema.optional(),
   result: ResultConfigSchema.optional(),
 }).strict();
 
 export type TaskSpec = z.infer<typeof TaskSpecSchema>;
 export type HardConstraints = z.infer<typeof HardConstraintsSchema>;
+export type SoftConstraints = z.infer<typeof SoftConstraintsSchema>;
+export type ScoringWeights = z.infer<typeof ScoringWeightsSchema>;
 export type Preferences = z.infer<typeof PreferencesSchema>;
 export type ResultConfig = z.infer<typeof ResultConfigSchema>;
 export type MaxPrice = z.infer<typeof MaxPriceSchema>;
@@ -109,6 +128,17 @@ export interface ShortlistEntryMinimal {
   context: number;
   supports: string[];
   age_days: number;
+  score: number;  // Total weighted score (0-1)
+}
+
+// Score breakdown for transparency
+export interface ScoreBreakdown {
+  semantic: number;   // 0-1
+  price: number;      // 0-1
+  parameters: number; // 0-1
+  recency: number;    // 0-1
+  context: number;    // 0-1
+  total: number;      // Weighted sum
 }
 
 // Result types - standard format (detail: "standard", default)
@@ -128,6 +158,7 @@ export interface ShortlistEntry {
     output?: string[];
   };
   supported_parameters?: string[];
+  score: ScoreBreakdown;  // Score with breakdown
   why_selected: string[];
   risks?: string[];
   request_skeleton?: RequestSkeleton;

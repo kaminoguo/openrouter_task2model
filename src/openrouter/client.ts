@@ -20,6 +20,25 @@ export interface ParametersResponse {
   };
 }
 
+export interface EmbeddingData {
+  object: string;
+  embedding: number[];
+  index: number;
+}
+
+export interface EmbeddingResponse {
+  object: string;
+  data: EmbeddingData[];
+  model: string;
+  usage: {
+    prompt_tokens: number;
+    total_tokens: number;
+  };
+}
+
+// Default embedding model - best quality/price ratio on MTEB
+const DEFAULT_EMBEDDING_MODEL = 'qwen/qwen3-embedding-8b';
+
 export type ClientResult<T> =
   | { ok: true; data: T; auth_used: boolean }
   | { ok: false; error: StructuredError };
@@ -120,4 +139,78 @@ export async function getParameters(modelId: string): Promise<ClientResult<Recor
 
 export function hasApiKey(): boolean {
   return !!getApiKey();
+}
+
+// Get embeddings for a list of texts
+export async function getEmbeddings(
+  texts: string[],
+  model: string = DEFAULT_EMBEDDING_MODEL
+): Promise<ClientResult<number[][]>> {
+  if (!hasApiKey()) {
+    return { ok: false, error: authRequired('API key required for embeddings') };
+  }
+
+  if (texts.length === 0) {
+    return { ok: true, data: [], auth_used: true };
+  }
+
+  try {
+    const response = await fetch(`${BASE_URL}/embeddings`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({
+        model,
+        input: texts,
+      }),
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, error: authRequired('Authentication required for embeddings') };
+    }
+
+    if (!response.ok) {
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        body = await response.text();
+      }
+      return {
+        ok: false,
+        error: upstreamError(
+          `OpenRouter Embeddings API returned status ${response.status}`,
+          response.status,
+          body
+        ),
+      };
+    }
+
+    const data = await response.json() as EmbeddingResponse;
+    // Sort by index to ensure order matches input
+    const sorted = data.data.sort((a, b) => a.index - b.index);
+    return { ok: true, data: sorted.map(d => d.embedding), auth_used: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: networkError('Failed to connect to OpenRouter Embeddings API', err),
+    };
+  }
+}
+
+// Compute cosine similarity between two vectors
+export function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
+
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+
+  const magnitude = Math.sqrt(normA) * Math.sqrt(normB);
+  return magnitude === 0 ? 0 : dotProduct / magnitude;
 }

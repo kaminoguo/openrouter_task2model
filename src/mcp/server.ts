@@ -22,7 +22,7 @@ import { log } from '../util/logger.js';
 const server = new McpServer(
   {
     name: 'openrouter-task2model',
-    version: '1.0.0',
+    version: '1.1.0',
   },
   {
     capabilities: {
@@ -153,7 +153,7 @@ server.registerTool(
 server.registerTool(
   'task2model',
   {
-    description: 'Recommend models based on task constraints. Returns top-K candidates with request skeletons.',
+    description: 'Recommend models based on task description and constraints. Uses semantic search (embeddings) + soft scoring to find best matches. Returns top-K candidates sorted by weighted score.',
     inputSchema: TaskSpecSchema,
   },
   async (args): Promise<{ content: Array<{ type: 'text'; text: string }> }> => {

@@ -1,7 +1,6 @@
 import type {
   TaskSpec,
   OpenRouterModel,
-  OpenRouterEndpoint,
   Task2ModelResult,
   ShortlistEntry,
   ShortlistEntryMinimal,
@@ -10,19 +9,37 @@ import type {
   ExcludedSummary,
   CatalogInfo,
   Modality,
+  ScoreBreakdown,
+  ScoringWeights,
 } from '../schema/taskSpec.js';
 import {
   getModelsCache,
   setModelsCache,
   isCacheValid,
   getCacheStatus,
+  getEmbeddingsCache,
+  addEmbeddings,
+  getModelEmbedding,
 } from '../catalog/cache.js';
-import { getModels, getEndpoints, hasApiKey } from '../openrouter/client.js';
+import { getModels, getEndpoints, hasApiKey, getEmbeddings, cosineSimilarity } from '../openrouter/client.js';
 import type { StructuredError } from '../util/errors.js';
 
 export type Task2ModelOutcome =
   | { ok: true; result: Task2ModelResult }
   | { ok: false; error: StructuredError };
+
+// Default scoring weights
+const DEFAULT_WEIGHTS: ScoringWeights = {
+  semantic: 0.35,
+  price: 0.20,
+  parameters: 0.25,
+  recency: 0.10,
+  context: 0.10,
+};
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 // Parse modalities from model architecture
 function parseModalities(model: OpenRouterModel): { input: string[]; output: string[] } {
@@ -31,7 +48,6 @@ function parseModalities(model: OpenRouterModel): { input: string[]; output: str
 
   const parseList = (part: string): string[] => {
     if (!part) return ['text'];
-    // Handle formats like "text+image" or "text,image" or just "text"
     return part.split(/[+,]/).map(s => s.trim().toLowerCase()).filter(Boolean);
   };
 
@@ -45,30 +61,238 @@ function parseModalities(model: OpenRouterModel): { input: string[]; output: str
 function parsePrice(priceStr: string | undefined): number {
   if (!priceStr) return Infinity;
   const val = parseFloat(priceStr);
-  return isNaN(val) ? Infinity : val * 1_000_000; // Convert per-token to per-1M
+  return isNaN(val) ? Infinity : val * 1_000_000;
 }
 
 // Calculate model age in days
 function getModelAgeDays(model: OpenRouterModel): number {
-  if (!model.created) return Infinity; // Unknown age treated as very old
+  if (!model.created) return Infinity;
   const now = Date.now();
-  const createdMs = model.created * 1000; // Convert Unix timestamp to ms
+  const createdMs = model.created * 1000;
   return Math.floor((now - createdMs) / (1000 * 60 * 60 * 24));
 }
 
-// Check if model is free (both prompt and completion are 0)
+// Check if model is free
 function isFreeModel(model: OpenRouterModel): boolean {
   const promptPrice = parseFloat(model.pricing.prompt || '0');
   const completionPrice = parseFloat(model.pricing.completion || '0');
   return promptPrice === 0 && completionPrice === 0;
 }
 
-// Extract provider from model ID (e.g., "anthropic/claude-3" -> "anthropic")
+// Extract provider from model ID
 function getProvider(modelId: string): string {
   return modelId.split('/')[0]?.toLowerCase() || '';
 }
 
-// Check if model meets hard constraints
+// Get total price for scoring
+function getTotalPrice(model: OpenRouterModel): number {
+  const promptPrice = parsePrice(model.pricing.prompt);
+  const completionPrice = parsePrice(model.pricing.completion);
+  return promptPrice + completionPrice;
+}
+
+// ============================================================================
+// Embedding Functions
+// ============================================================================
+
+// Build rich embedding text for a model
+function buildEmbeddingText(model: OpenRouterModel): string {
+  const provider = getProvider(model.id);
+  const params = model.supported_parameters?.join(', ') || 'none';
+  const modalities = parseModalities(model);
+  const inputMods = modalities.input.join(', ');
+  const outputMods = modalities.output.join(', ');
+
+  // Create semantically rich text
+  const parts = [
+    model.name,
+    `by ${provider}`,
+    model.description || '',
+    `Supports: ${params}`,
+    `Input: ${inputMods}`,
+    `Output: ${outputMods}`,
+    `Context: ${model.context_length} tokens`,
+  ];
+
+  return parts.filter(Boolean).join('. ');
+}
+
+// Ensure embeddings exist for all models, fetch missing ones
+async function ensureEmbeddings(
+  models: OpenRouterModel[]
+): Promise<{ ok: true } | { ok: false; error: StructuredError }> {
+  if (!hasApiKey()) {
+    // No API key - skip embeddings, will use 0 for semantic score
+    return { ok: true };
+  }
+
+  const cache = getEmbeddingsCache();
+  const modelIds = models.map(m => m.id);
+
+  // Find models without embeddings
+  const missingIds = modelIds.filter(id => !cache?.embeddings[id]);
+
+  if (missingIds.length === 0) {
+    return { ok: true };
+  }
+
+  // Build embedding texts for missing models
+  const missingModels = models.filter(m => missingIds.includes(m.id));
+  const texts = missingModels.map(m => buildEmbeddingText(m));
+
+  // Batch fetch embeddings (max 100 at a time to avoid API limits)
+  const BATCH_SIZE = 100;
+  const newEmbeddings: Record<string, number[]> = {};
+
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const batchTexts = texts.slice(i, i + BATCH_SIZE);
+    const batchIds = missingIds.slice(i, i + BATCH_SIZE);
+
+    const result = await getEmbeddings(batchTexts);
+    if (!result.ok) {
+      // Embedding failed - continue without semantic scoring
+      console.error('Failed to fetch embeddings:', result.error);
+      return { ok: true }; // Don't fail the whole operation
+    }
+
+    for (let j = 0; j < batchIds.length; j++) {
+      newEmbeddings[batchIds[j]] = result.data[j];
+    }
+  }
+
+  // Update cache
+  addEmbeddings(newEmbeddings);
+  return { ok: true };
+}
+
+// Get semantic similarity score between task and model
+async function getSemanticScore(
+  taskText: string,
+  modelId: string
+): Promise<number> {
+  if (!hasApiKey()) return 0;
+
+  const modelEmbedding = getModelEmbedding(modelId);
+  if (!modelEmbedding) return 0;
+
+  // Get task embedding
+  const result = await getEmbeddings([taskText]);
+  if (!result.ok || result.data.length === 0) return 0;
+
+  const taskEmbedding = result.data[0];
+  const similarity = cosineSimilarity(taskEmbedding, modelEmbedding);
+
+  // Normalize to 0-1 range (cosine similarity is -1 to 1)
+  return (similarity + 1) / 2;
+}
+
+// ============================================================================
+// Scoring Functions
+// ============================================================================
+
+// Calculate price score (0-1, lower price = higher score)
+function getPriceScore(model: OpenRouterModel, targetPrice?: { prompt_per_1m?: number; completion_per_1m?: number }): number {
+  const totalPrice = getTotalPrice(model);
+
+  if (totalPrice === 0) return 1; // Free is best for price
+  if (totalPrice === Infinity) return 0;
+
+  if (targetPrice) {
+    const targetTotal = (targetPrice.prompt_per_1m || 0) + (targetPrice.completion_per_1m || 0);
+    if (targetTotal > 0) {
+      // Score based on how close to target (or below)
+      if (totalPrice <= targetTotal) return 1;
+      // Gradual degradation up to 3x target price
+      const ratio = totalPrice / targetTotal;
+      return Math.max(0, 1 - (ratio - 1) / 2);
+    }
+  }
+
+  // Default: score based on absolute price (cheaper = better)
+  // Assume $10/1M is "average", score degrades linearly
+  const avgPrice = 10;
+  if (totalPrice <= avgPrice) return 1;
+  return Math.max(0, 1 - (totalPrice - avgPrice) / (avgPrice * 10));
+}
+
+// Calculate parameter coverage score (0-1)
+function getParamScore(model: OpenRouterModel, requiredParams?: string[]): number {
+  if (!requiredParams || requiredParams.length === 0) return 1;
+  const supportedParams = new Set(model.supported_parameters || []);
+  const covered = requiredParams.filter(p => supportedParams.has(p)).length;
+  return covered / requiredParams.length;
+}
+
+// Calculate recency score (0-1, newer = higher if preferred)
+function getRecencyScore(model: OpenRouterModel, preferNewer: boolean, minAgeDays?: number): number {
+  const ageDays = getModelAgeDays(model);
+
+  if (ageDays === Infinity) return 0.5; // Unknown age = neutral
+
+  // If there's a minimum age preference, penalize newer models
+  if (minAgeDays !== undefined && ageDays < minAgeDays) {
+    // Soft penalty: linearly decrease score for models younger than minAgeDays
+    return Math.max(0.2, ageDays / minAgeDays);
+  }
+
+  if (preferNewer) {
+    // Newer is better: models < 30 days get 1.0, degrades over 2 years
+    if (ageDays <= 30) return 1;
+    return Math.max(0.3, 1 - (ageDays - 30) / 700);
+  } else {
+    // Older is better (more stable): models > 180 days get 1.0
+    if (ageDays >= 180) return 1;
+    return Math.max(0.5, ageDays / 180);
+  }
+}
+
+// Calculate context length score (0-1)
+function getContextScore(model: OpenRouterModel, targetContext?: number): number {
+  if (!targetContext) return 1; // No target = all equal
+
+  if (model.context_length >= targetContext) return 1;
+
+  // Soft penalty for not meeting target
+  return model.context_length / targetContext;
+}
+
+// Calculate total weighted score
+function calculateScore(
+  model: OpenRouterModel,
+  semanticScore: number,
+  spec: TaskSpec,
+  weights: ScoringWeights
+): ScoreBreakdown {
+  const priceScore = getPriceScore(model, spec.soft_constraints?.target_price);
+  const paramScore = getParamScore(model, spec.hard_constraints?.required_parameters);
+  const recencyScore = getRecencyScore(
+    model,
+    spec.preferences?.prefer_newer ?? true,
+    spec.soft_constraints?.min_age_days
+  );
+  const contextScore = getContextScore(model, spec.soft_constraints?.target_context_length);
+
+  const total =
+    weights.semantic * semanticScore +
+    weights.price * priceScore +
+    weights.parameters * paramScore +
+    weights.recency * recencyScore +
+    weights.context * contextScore;
+
+  return {
+    semantic: semanticScore,
+    price: priceScore,
+    parameters: paramScore,
+    recency: recencyScore,
+    context: contextScore,
+    total,
+  };
+}
+
+// ============================================================================
+// Hard Constraints (True Dealbreakers Only)
+// ============================================================================
+
 function meetsHardConstraints(
   model: OpenRouterModel,
   constraints: TaskSpec['hard_constraints'],
@@ -78,7 +302,17 @@ function meetsHardConstraints(
 
   const modalities = parseModalities(model);
 
-  // Check input modalities
+  // Check required parameters (dealbreaker - can't fake tool support)
+  if (constraints.required_parameters && constraints.required_parameters.length > 0) {
+    const supportedParams = new Set(model.supported_parameters || []);
+    const missingParams = constraints.required_parameters.filter(p => !supportedParams.has(p));
+    if (missingParams.length > 0) {
+      exclusionReasons.set('missing_required_parameters', (exclusionReasons.get('missing_required_parameters') || 0) + 1);
+      return false;
+    }
+  }
+
+  // Check input modalities (dealbreaker - can't process unsupported input)
   if (constraints.input_modalities && constraints.input_modalities.length > 0) {
     const hasAllInputs = constraints.input_modalities.every(
       (m: Modality) => modalities.input.includes(m)
@@ -89,7 +323,7 @@ function meetsHardConstraints(
     }
   }
 
-  // Check output modalities
+  // Check output modalities (dealbreaker)
   if (constraints.output_modalities && constraints.output_modalities.length > 0) {
     const hasAllOutputs = constraints.output_modalities.every(
       (m: Modality) => modalities.output.includes(m)
@@ -100,60 +334,7 @@ function meetsHardConstraints(
     }
   }
 
-  // Check context length
-  if (constraints.min_context_length !== undefined) {
-    if (model.context_length < constraints.min_context_length) {
-      exclusionReasons.set('context_too_small', (exclusionReasons.get('context_too_small') || 0) + 1);
-      return false;
-    }
-  }
-
-  // Check price
-  if (constraints.max_price) {
-    const promptPrice = parsePrice(model.pricing.prompt);
-    const completionPrice = parsePrice(model.pricing.completion);
-    const requestPrice = model.pricing.request ? parseFloat(model.pricing.request) : 0;
-
-    if (constraints.max_price.prompt_per_1m !== undefined && promptPrice > constraints.max_price.prompt_per_1m) {
-      exclusionReasons.set('prompt_price_too_high', (exclusionReasons.get('prompt_price_too_high') || 0) + 1);
-      return false;
-    }
-    if (constraints.max_price.completion_per_1m !== undefined && completionPrice > constraints.max_price.completion_per_1m) {
-      exclusionReasons.set('completion_price_too_high', (exclusionReasons.get('completion_price_too_high') || 0) + 1);
-      return false;
-    }
-    if (constraints.max_price.request !== undefined && requestPrice > constraints.max_price.request) {
-      exclusionReasons.set('request_price_too_high', (exclusionReasons.get('request_price_too_high') || 0) + 1);
-      return false;
-    }
-  }
-
-  // Check required parameters
-  if (constraints.required_parameters && constraints.required_parameters.length > 0) {
-    const supportedParams = new Set(model.supported_parameters || []);
-    const missingParams = constraints.required_parameters.filter(p => !supportedParams.has(p));
-    if (missingParams.length > 0) {
-      exclusionReasons.set('missing_required_parameters', (exclusionReasons.get('missing_required_parameters') || 0) + 1);
-      return false;
-    }
-  }
-
-  // Check minimum age (exclude new/untested models)
-  if (constraints.min_age_days !== undefined) {
-    const ageDays = getModelAgeDays(model);
-    if (ageDays < constraints.min_age_days) {
-      exclusionReasons.set('too_new', (exclusionReasons.get('too_new') || 0) + 1);
-      return false;
-    }
-  }
-
-  // Check exclude free models
-  if (constraints.exclude_free && isFreeModel(model)) {
-    exclusionReasons.set('free_model', (exclusionReasons.get('free_model') || 0) + 1);
-    return false;
-  }
-
-  // Check provider whitelist
+  // Check provider whitelist (dealbreaker if specified)
   if (constraints.providers && constraints.providers.length > 0) {
     const modelProvider = getProvider(model.id);
     const allowedProviders = constraints.providers.map(p => p.toLowerCase());
@@ -163,66 +344,24 @@ function meetsHardConstraints(
     }
   }
 
+  // Exclude free models (dealbreaker if specified)
+  if (constraints.exclude_free && isFreeModel(model)) {
+    exclusionReasons.set('free_model', (exclusionReasons.get('free_model') || 0) + 1);
+    return false;
+  }
+
   return true;
 }
 
-// Calculate parameter coverage score (for sorting)
-function getParamCoverageScore(model: OpenRouterModel, requiredParams: string[] | undefined): number {
-  if (!requiredParams || requiredParams.length === 0) return 1;
-  const supportedParams = new Set(model.supported_parameters || []);
-  const covered = requiredParams.filter(p => supportedParams.has(p)).length;
-  return covered / requiredParams.length;
-}
+// ============================================================================
+// Result Building
+// ============================================================================
 
-// Get total price for sorting
-function getTotalPrice(model: OpenRouterModel): number {
-  const promptPrice = parsePrice(model.pricing.prompt);
-  const completionPrice = parsePrice(model.pricing.completion);
-  return promptPrice + completionPrice;
-}
-
-// Sort models by preferences
-function sortModels(
-  models: OpenRouterModel[],
-  preferences: TaskSpec['preferences'],
-  requiredParams: string[] | undefined
-): OpenRouterModel[] {
-  const preferNewer = preferences?.prefer_newer ?? true;
-  const routing = preferences?.routing ?? 'price';
-
-  return [...models].sort((a, b) => {
-    // 1. Parameter coverage (descending)
-    const coverageA = getParamCoverageScore(a, requiredParams);
-    const coverageB = getParamCoverageScore(b, requiredParams);
-    if (coverageA !== coverageB) return coverageB - coverageA;
-
-    // 2. Routing preference
-    if (routing === 'price') {
-      const priceA = getTotalPrice(a);
-      const priceB = getTotalPrice(b);
-      if (priceA !== priceB) return priceA - priceB;
-    }
-    // Note: throughput/latency are handled via provider.sort in skeleton, not here
-
-    // 3. Created date (descending, if prefer_newer)
-    if (preferNewer) {
-      const createdA = a.created ?? 0;
-      const createdB = b.created ?? 0;
-      if (createdA !== createdB) return createdB - createdA;
-    }
-
-    // 4. Context length (descending, tie-breaker)
-    return b.context_length - a.context_length;
-  });
-}
-
-// Check if :exacto variant exists
 function hasExactoVariant(modelId: string, allModels: OpenRouterModel[]): boolean {
   const exactoId = `${modelId}:exacto`;
   return allModels.some(m => m.id === exactoId);
 }
 
-// Generate request skeleton
 function generateSkeleton(
   model: OpenRouterModel,
   allModels: OpenRouterModel[],
@@ -232,7 +371,6 @@ function generateSkeleton(
   const preferExacto = preferences?.prefer_exacto_for_tools ?? true;
   const routing = preferences?.routing ?? 'price';
 
-  // Determine if we should use :exacto variant
   let modelIdToUse = model.id;
   if (preferExacto && requiredParams) {
     const needsExacto = requiredParams.some(p => ['tools', 'tool_choice'].includes(p));
@@ -250,7 +388,6 @@ function generateSkeleton(
     },
   };
 
-  // Set provider sort based on routing
   if (routing === 'throughput') {
     skeleton.provider.sort = 'throughput';
   } else if (routing === 'latency') {
@@ -262,48 +399,30 @@ function generateSkeleton(
   return skeleton;
 }
 
-// Generate why_selected reasons
-function generateReasons(
-  model: OpenRouterModel,
-  constraints: TaskSpec['hard_constraints']
-): string[] {
+function generateReasons(score: ScoreBreakdown, spec: TaskSpec): string[] {
   const reasons: string[] = [];
 
-  if (constraints?.required_parameters && constraints.required_parameters.length > 0) {
-    const supported = model.supported_parameters || [];
-    const matched = constraints.required_parameters.filter(p => supported.includes(p));
-    if (matched.length > 0) {
-      reasons.push(`supports ${matched.join('+')}`);
-    }
-  }
-
-  if (constraints?.min_context_length !== undefined) {
-    reasons.push(`context>=${constraints.min_context_length / 1000}k`);
-  }
-
-  if (constraints?.max_price) {
-    reasons.push('within budget');
-  }
-
-  if (constraints?.input_modalities || constraints?.output_modalities) {
-    reasons.push('modality match');
+  if (score.semantic >= 0.7) reasons.push('high semantic match');
+  if (score.parameters === 1) reasons.push('full param support');
+  if (score.price >= 0.8) reasons.push('good price');
+  if (score.context === 1 && spec.soft_constraints?.target_context_length) {
+    reasons.push(`context>=${spec.soft_constraints.target_context_length / 1000}k`);
   }
 
   if (reasons.length === 0) {
-    reasons.push('meets all constraints');
+    reasons.push(`score: ${score.total.toFixed(2)}`);
   }
 
   return reasons;
 }
 
-// Check endpoints for parameter support
 async function checkEndpoints(
   modelId: string,
   requiredParams: string[] | undefined,
   includeEndpoints: boolean
 ): Promise<{ summary?: EndpointsSummary; risk?: string }> {
   if (!includeEndpoints) {
-    return { risk: 'endpoints not checked' };
+    return {};
   }
 
   const result = await getEndpoints(modelId);
@@ -336,27 +455,18 @@ async function checkEndpoints(
   };
 }
 
-// Build minimal format entry
-function buildMinimalEntry(model: OpenRouterModel): ShortlistEntryMinimal {
-  const promptPrice = parseFloat(model.pricing.prompt || '0') * 1_000_000;
-  const completionPrice = parseFloat(model.pricing.completion || '0') * 1_000_000;
-  return {
-    model_id: model.id,
-    name: model.name,
-    price: { prompt: promptPrice, completion: completionPrice },
-    context: model.context_length,
-    supports: model.supported_parameters || [],
-    age_days: getModelAgeDays(model),
-  };
-}
+// ============================================================================
+// Main Function
+// ============================================================================
 
-// Main task2model function
 export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const forceRefresh = spec.result?.force_refresh ?? false;
   const limit = spec.result?.limit ?? 50;
   const includeEndpoints = spec.result?.include_endpoints ?? false;
   const includeRequestSkeleton = spec.result?.include_request_skeleton ?? false;
   const detailLevel = spec.result?.detail ?? 'minimal';
+  const useSemanticSearch = spec.preferences?.use_semantic_search ?? true;
+  const weights = { ...DEFAULT_WEIGHTS, ...spec.preferences?.scoring_weights };
   const requiredParams = spec.hard_constraints?.required_parameters;
 
   // Freshness gate: ensure cache is valid
@@ -386,35 +496,73 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const totalModels = allModels.length;
   const exclusionReasons = new Map<string, number>();
 
-  // Hard constraint filtering
+  // Step 1: Hard constraint filtering (true dealbreakers only)
   const filtered = allModels.filter(model =>
     meetsHardConstraints(model, spec.hard_constraints, exclusionReasons)
   );
 
-  // Sort by preferences
-  const sorted = sortModels(filtered, spec.preferences, requiredParams);
+  // Step 2: Ensure embeddings exist for filtered models
+  if (useSemanticSearch && hasApiKey()) {
+    await ensureEmbeddings(filtered);
+  }
 
-  // Take top N
-  const shortlisted = sorted.slice(0, limit);
+  // Step 3: Get task embedding for semantic scoring
+  let taskEmbedding: number[] | null = null;
+  if (useSemanticSearch && hasApiKey()) {
+    const result = await getEmbeddings([spec.task]);
+    if (result.ok && result.data.length > 0) {
+      taskEmbedding = result.data[0];
+    }
+  }
 
-  // Build shortlist entries based on detail level
+  // Step 4: Score all models
+  const scored = filtered.map(model => {
+    let semanticScore = 0;
+    if (taskEmbedding) {
+      const modelEmbedding = getModelEmbedding(model.id);
+      if (modelEmbedding) {
+        const similarity = cosineSimilarity(taskEmbedding, modelEmbedding);
+        semanticScore = (similarity + 1) / 2; // Normalize to 0-1
+      }
+    }
+
+    const score = calculateScore(model, semanticScore, spec, weights);
+    return { model, score };
+  });
+
+  // Step 5: Sort by total score (descending)
+  scored.sort((a, b) => b.score.total - a.score.total);
+
+  // Step 6: Take top N
+  const shortlisted = scored.slice(0, limit);
+
+  // Step 7: Build result based on detail level
   let shortlist: (ShortlistEntry | ShortlistEntryMinimal | OpenRouterModel)[];
 
   if (detailLevel === 'minimal') {
-    // Minimal: compact format, no async operations
-    shortlist = shortlisted.map(model => buildMinimalEntry(model));
+    shortlist = shortlisted.map(({ model, score }) => {
+      const promptPrice = parseFloat(model.pricing.prompt || '0') * 1_000_000;
+      const completionPrice = parseFloat(model.pricing.completion || '0') * 1_000_000;
+      return {
+        model_id: model.id,
+        name: model.name,
+        price: { prompt: promptPrice, completion: completionPrice },
+        context: model.context_length,
+        supports: model.supported_parameters || [],
+        age_days: getModelAgeDays(model),
+        score: score.total,
+      };
+    });
   } else if (detailLevel === 'full') {
-    // Full: return raw OpenRouter model data
-    shortlist = shortlisted.map(model => model);
+    shortlist = shortlisted.map(({ model }) => model);
   } else {
-    // Standard: default format with reasons and optional extras
+    // Standard format
     shortlist = await Promise.all(
-      shortlisted.map(async model => {
+      shortlisted.map(async ({ model, score }) => {
         const modalities = parseModalities(model);
-        const reasons = generateReasons(model, spec.hard_constraints);
+        const reasons = generateReasons(score, spec);
         const risks: string[] = [];
 
-        // Check endpoints if requested
         const endpointCheck = await checkEndpoints(model.id, requiredParams, includeEndpoints);
         if (endpointCheck.risk) {
           risks.push(endpointCheck.risk);
@@ -436,6 +584,7 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
             output: modalities.output,
           },
           supported_parameters: model.supported_parameters,
+          score,
           why_selected: reasons,
           risks: risks.length > 0 ? risks : undefined,
         };
