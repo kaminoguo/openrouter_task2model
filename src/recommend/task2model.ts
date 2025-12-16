@@ -104,20 +104,9 @@ function paramsToNaturalLanguage(params: string[] | undefined): string {
   return `Good for ${capabilities.join(', ')}.`;
 }
 
-// Build embedding text: name + provider + description + natural language capabilities
+// Build embedding text: description only (no name/capabilities to avoid keyword bias)
 function buildEmbeddingText(model: OpenRouterModel): string {
-  const provider = getProvider(model.id);
-  const description = model.description || '';
-  const capabilities = paramsToNaturalLanguage(model.supported_parameters);
-
-  const parts = [
-    model.name,
-    `by ${provider}`,
-    description,
-    capabilities,
-  ].filter(Boolean);
-
-  return parts.join('. ');
+  return model.description || '';
 }
 
 // Ensure embeddings exist for all models
