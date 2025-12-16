@@ -30,9 +30,9 @@ claude mcp add openrouter-task2model -e OPENROUTER_API_KEY=sk-or-... -- npx -y o
 
 **The AI decides which model to use, not the embeddings.**
 
-Semantic search narrows down 300+ models to ~100 candidates. From there, the AI uses its own knowledge to decide which models to benchmark. The ranking within those 100 is not a quality indicator - it just helps reduce the search space.
+Price limits, age filters, and semantic search narrow down 300+ models to ~100 candidates. From there, the AI uses its own knowledge to decide which models to benchmark. The ranking within those 100 is not a quality indicator - it just helps reduce the search space.
 
-Think of it as: embeddings filter, AI selects.
+Think of it as: price + date + embeddings filter, AI selects.
 
 ## Tools
 
