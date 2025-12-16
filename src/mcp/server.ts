@@ -22,7 +22,7 @@ import { log } from '../util/logger.js';
 const server = new McpServer(
   {
     name: 'openrouter-task2model',
-    version: '1.3.2',
+    version: '1.3.3',
   },
   {
     capabilities: {
@@ -153,7 +153,12 @@ server.registerTool(
 server.registerTool(
   'task2model',
   {
-    description: 'Recommend models based on task description and constraints. Uses semantic search (embeddings) + soft scoring to find best matches. Returns top-K candidates sorted by weighted score.',
+    description: `Recommend models for a task. Returns top 50 model IDs filtered by age (<1 year) and ranked by semantic match.
+
+IMPORTANT: Use default parameters (just provide "task"). Only add constraints if user explicitly requests them.
+
+Defaults: limit=50, detail=names_only, max_age_days=365
+Optional: hard_constraints.max_price_per_1m, hard_constraints.required_parameters, result.detail (minimal|standard|full)`,
     inputSchema: TaskSpecSchema,
   },
   async (args): Promise<{ content: Array<{ type: 'text'; text: string }> }> => {

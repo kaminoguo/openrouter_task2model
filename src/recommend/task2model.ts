@@ -21,6 +21,7 @@ import {
   getEmbeddingsCache,
   addEmbeddings,
   getModelEmbedding,
+  clearEmbeddingsCache,
 } from '../catalog/cache.js';
 import { getModels, getEndpoints, hasApiKey, getApiKeyStatus, getEmbeddings, cosineSimilarity } from '../openrouter/client.js';
 import type { StructuredError } from '../util/errors.js';
@@ -363,6 +364,10 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   let source: 'live' | 'cache' = 'cache';
 
   if (!isCacheValid(cache) || forceRefresh) {
+    // Clear embeddings too on force refresh (embedding text format may have changed)
+    if (forceRefresh) {
+      clearEmbeddingsCache();
+    }
     const modelsResult = await getModels();
     if (!modelsResult.ok) {
       return { ok: false, error: modelsResult.error };
