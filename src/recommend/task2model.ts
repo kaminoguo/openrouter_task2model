@@ -181,6 +181,14 @@ function meetsHardConstraints(
   constraints: TaskSpec['hard_constraints'],
   exclusionReasons: Map<string, number>
 ): boolean {
+  // Max age filter always applies (default 365 days)
+  const maxAgeDays = constraints?.max_age_days ?? 365;
+  const modelAge = getModelAgeDays(model);
+  if (modelAge > maxAgeDays) {
+    exclusionReasons.set('too_old', (exclusionReasons.get('too_old') || 0) + 1);
+    return false;
+  }
+
   if (!constraints) return true;
 
   const modalities = parseModalities(model);
@@ -230,14 +238,6 @@ function meetsHardConstraints(
   // Exclude free models
   if (constraints.exclude_free && isFreeModel(model)) {
     exclusionReasons.set('free_model', (exclusionReasons.get('free_model') || 0) + 1);
-    return false;
-  }
-
-  // Max age filter (default 365 days)
-  const maxAgeDays = constraints.max_age_days ?? 365;
-  const modelAge = getModelAgeDays(model);
-  if (modelAge > maxAgeDays) {
-    exclusionReasons.set('too_old', (exclusionReasons.get('too_old') || 0) + 1);
     return false;
   }
 
@@ -365,7 +365,7 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const limit = spec.result?.limit ?? 50;
   const includeEndpoints = spec.result?.include_endpoints ?? false;
   const includeRequestSkeleton = spec.result?.include_request_skeleton ?? false;
-  const detailLevel = spec.result?.detail ?? 'minimal';
+  const detailLevel = spec.result?.detail ?? 'names_only';
   const routing = spec.preferences?.routing ?? 'price';
   const requiredParams = spec.hard_constraints?.required_parameters;
 
