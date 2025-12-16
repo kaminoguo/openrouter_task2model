@@ -44,7 +44,13 @@ export type ClientResult<T> =
   | { ok: false; error: StructuredError };
 
 function getApiKey(): string | undefined {
-  return process.env.OPENROUTER_API_KEY;
+  const key = process.env.OPENROUTER_API_KEY?.trim();
+  if (!key) return undefined;
+  // Only reject obvious placeholder values
+  if (key === 'sk-or-...' || key === 'sk-or-xxx' || key.length < 10) {
+    return undefined;
+  }
+  return key;
 }
 
 function getHeaders(): Record<string, string> {
@@ -141,6 +147,23 @@ export function hasApiKey(): boolean {
   return !!getApiKey();
 }
 
+// Get API key status for debugging (masked)
+export function getApiKeyStatus(): { valid: boolean; format: string } {
+  const raw = process.env.OPENROUTER_API_KEY?.trim();
+  if (!raw) {
+    return { valid: false, format: 'not set' };
+  }
+  if (raw === 'sk-or-...' || raw === 'sk-or-xxx') {
+    return { valid: false, format: 'placeholder value' };
+  }
+  if (raw.length < 10) {
+    return { valid: false, format: `too short (${raw.length} chars)` };
+  }
+  // Mask key for display: show first 4 and last 4 chars
+  const masked = `${raw.slice(0, 4)}***${raw.slice(-4)}`;
+  return { valid: true, format: `${masked} (${raw.length} chars)` };
+}
+
 // Get embeddings for a list of texts
 export async function getEmbeddings(
   texts: string[],
@@ -164,10 +187,6 @@ export async function getEmbeddings(
       }),
     });
 
-    if (response.status === 401 || response.status === 403) {
-      return { ok: false, error: authRequired('Authentication required for embeddings') };
-    }
-
     if (!response.ok) {
       let body: unknown;
       try {
@@ -175,6 +194,14 @@ export async function getEmbeddings(
       } catch {
         body = await response.text();
       }
+
+      if (response.status === 401 || response.status === 403) {
+        return {
+          ok: false,
+          error: authRequired(`Embeddings auth failed (${response.status}): ${JSON.stringify(body)}`)
+        };
+      }
+
       return {
         ok: false,
         error: upstreamError(

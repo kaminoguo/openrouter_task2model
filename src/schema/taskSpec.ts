@@ -3,76 +3,45 @@ import { z } from 'zod';
 // Modality types
 const ModalitySchema = z.enum(['text', 'image', 'audio', 'video']);
 
-// Max price constraints
-const MaxPriceSchema = z.object({
-  prompt_per_1m: z.number().optional(),
-  completion_per_1m: z.number().optional(),
-  request: z.number().optional(),
-}).strict();
-
 // Hard constraints - TRUE dealbreakers only (binary pass/fail)
 const HardConstraintsSchema = z.object({
-  // These are true dealbreakers - model is excluded if not met
   required_parameters: z.array(z.string()).optional(),  // Must support these (e.g., ["tools"])
   input_modalities: z.array(ModalitySchema).optional(), // Must support these inputs
   output_modalities: z.array(ModalitySchema).optional(),// Must support these outputs
   providers: z.array(z.string()).optional(),            // Must be from these providers
   exclude_free: z.boolean().optional(),                 // Exclude $0 models
-}).strict();
-
-// Soft constraints - contribute to scoring (not binary exclusion)
-const SoftConstraintsSchema = z.object({
-  target_context_length: z.number().int().positive().optional(), // Ideal context length
-  target_price: MaxPriceSchema.optional(),                        // Ideal price (scores degrade above)
-  prefer_mature: z.boolean().default(true),                       // Prefer models > 30 days old
-  min_age_days: z.number().int().nonnegative().optional(),        // Soft penalty for newer models
-}).strict();
-
-// Scoring weights - how much each factor matters (0-1, should sum to ~1)
-const ScoringWeightsSchema = z.object({
-  semantic: z.number().min(0).max(1).default(0.35),   // Task↔description similarity
-  price: z.number().min(0).max(1).default(0.20),      // Lower price = higher score
-  parameters: z.number().min(0).max(1).default(0.25),  // Required param coverage
-  recency: z.number().min(0).max(1).default(0.10),    // Newer = higher (if prefer_newer)
-  context: z.number().min(0).max(1).default(0.10),    // Context length fit
+  max_age_days: z.number().int().positive().default(365), // Max model age (default 1 year)
+  max_price_per_1m: z.number().positive().optional(),   // Max $/1M tokens (prompt+completion)
 }).strict();
 
 // Preferences for sorting/routing
 const PreferencesSchema = z.object({
-  prefer_newer: z.boolean().default(true),
-  routing: z.enum(['price', 'throughput', 'latency']).default('price'),
+  routing: z.enum(['price', 'throughput', 'latency']).default('price'),  // Secondary sort
   prefer_exacto_for_tools: z.boolean().default(true),
-  top_provider_only: z.boolean().default(false),
-  use_semantic_search: z.boolean().default(true),  // Enable embedding-based matching
-  scoring_weights: ScoringWeightsSchema.optional(),
 }).strict();
 
 // Result configuration
 const ResultConfigSchema = z.object({
-  limit: z.number().int().positive().default(50),  // Default higher for initial scan
+  limit: z.number().int().positive().default(50),
   include_endpoints: z.boolean().default(false),
   include_parameters: z.boolean().default(false),
-  include_request_skeleton: z.boolean().default(false),  // Off by default for minimal scans
+  include_request_skeleton: z.boolean().default(false),
   force_refresh: z.boolean().default(false),
-  detail: z.enum(['minimal', 'standard', 'full']).default('minimal'),  // Start with minimal scan
+  detail: z.enum(['names_only', 'minimal', 'standard', 'full']).default('names_only'),
 }).strict();
 
-// Main TaskSpec schema
+// Main TaskSpec schema - simplified
 export const TaskSpecSchema = z.object({
-  task: z.string().min(1, 'Task description is required'),
-  hard_constraints: HardConstraintsSchema.optional(),
-  soft_constraints: SoftConstraintsSchema.optional(),
-  preferences: PreferencesSchema.optional(),
+  task: z.string().min(1, 'Task description is required'),  // Main ranking via embedding
+  hard_constraints: HardConstraintsSchema.optional(),        // Dealbreakers only
+  preferences: PreferencesSchema.optional(),                 // Secondary sort
   result: ResultConfigSchema.optional(),
 }).strict();
 
 export type TaskSpec = z.infer<typeof TaskSpecSchema>;
 export type HardConstraints = z.infer<typeof HardConstraintsSchema>;
-export type SoftConstraints = z.infer<typeof SoftConstraintsSchema>;
-export type ScoringWeights = z.infer<typeof ScoringWeightsSchema>;
 export type Preferences = z.infer<typeof PreferencesSchema>;
 export type ResultConfig = z.infer<typeof ResultConfigSchema>;
-export type MaxPrice = z.infer<typeof MaxPriceSchema>;
 export type Modality = z.infer<typeof ModalitySchema>;
 
 // OpenRouter model structure (from /api/v1/models)
@@ -128,20 +97,10 @@ export interface ShortlistEntryMinimal {
   context: number;
   supports: string[];
   age_days: number;
-  score: number;  // Total weighted score (0-1)
+  semantic_score: number;  // Embedding similarity (0-1)
 }
 
-// Score breakdown for transparency
-export interface ScoreBreakdown {
-  semantic: number;   // 0-1
-  price: number;      // 0-1
-  parameters: number; // 0-1
-  recency: number;    // 0-1
-  context: number;    // 0-1
-  total: number;      // Weighted sum
-}
-
-// Result types - standard format (detail: "standard", default)
+// Result types - standard format (detail: "standard")
 export interface ShortlistEntry {
   model_id: string;
   name?: string;
@@ -158,9 +117,8 @@ export interface ShortlistEntry {
     output?: string[];
   };
   supported_parameters?: string[];
-  score: ScoreBreakdown;  // Score with breakdown
+  semantic_score: number;  // Embedding similarity (0-1)
   why_selected: string[];
-  risks?: string[];
   request_skeleton?: RequestSkeleton;
   endpoints_summary?: EndpointsSummary;
 }
@@ -197,12 +155,33 @@ export interface CatalogInfo {
   auth_used: boolean;
 }
 
-export interface Task2ModelResult {
+export interface EmbeddingStatus {
+  enabled: boolean;
+  api_key_status: string;  // masked key info for debugging
+  task_embedded: boolean;
+  models_embedded: number;
+  models_failed: number;
+  error?: string;
+}
+
+// Result for names_only mode - ultra compact
+export interface Task2ModelResultNamesOnly {
+  task: string;
+  models: string[];  // Just model IDs
+  count: number;
+  price_range: string;  // e.g., "$0.10-$15.00/1M"
+}
+
+// Result for other modes
+export interface Task2ModelResultFull {
   task: string;
   shortlist: (ShortlistEntry | ShortlistEntryMinimal | OpenRouterModel)[];
   excluded_summary: ExcludedSummary;
   catalog: CatalogInfo;
+  embeddings: EmbeddingStatus;
 }
+
+export type Task2ModelResult = Task2ModelResultNamesOnly | Task2ModelResultFull;
 
 // Sync catalog result
 export interface SyncCatalogResult {

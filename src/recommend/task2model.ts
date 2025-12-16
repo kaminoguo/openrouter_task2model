@@ -2,6 +2,8 @@ import type {
   TaskSpec,
   OpenRouterModel,
   Task2ModelResult,
+  Task2ModelResultNamesOnly,
+  Task2ModelResultFull,
   ShortlistEntry,
   ShortlistEntryMinimal,
   RequestSkeleton,
@@ -9,8 +11,7 @@ import type {
   ExcludedSummary,
   CatalogInfo,
   Modality,
-  ScoreBreakdown,
-  ScoringWeights,
+  EmbeddingStatus,
 } from '../schema/taskSpec.js';
 import {
   getModelsCache,
@@ -21,27 +22,17 @@ import {
   addEmbeddings,
   getModelEmbedding,
 } from '../catalog/cache.js';
-import { getModels, getEndpoints, hasApiKey, getEmbeddings, cosineSimilarity } from '../openrouter/client.js';
+import { getModels, getEndpoints, hasApiKey, getApiKeyStatus, getEmbeddings, cosineSimilarity } from '../openrouter/client.js';
 import type { StructuredError } from '../util/errors.js';
 
 export type Task2ModelOutcome =
   | { ok: true; result: Task2ModelResult }
   | { ok: false; error: StructuredError };
 
-// Default scoring weights
-const DEFAULT_WEIGHTS: ScoringWeights = {
-  semantic: 0.35,
-  price: 0.20,
-  parameters: 0.25,
-  recency: 0.10,
-  context: 0.10,
-};
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-// Parse modalities from model architecture
 function parseModalities(model: OpenRouterModel): { input: string[]; output: string[] } {
   const modality = model.architecture?.modality || 'text->text';
   const [inputPart, outputPart] = modality.split('->');
@@ -57,14 +48,12 @@ function parseModalities(model: OpenRouterModel): { input: string[]; output: str
   };
 }
 
-// Parse price string to number (per 1M tokens)
 function parsePrice(priceStr: string | undefined): number {
   if (!priceStr) return Infinity;
   const val = parseFloat(priceStr);
   return isNaN(val) ? Infinity : val * 1_000_000;
 }
 
-// Calculate model age in days
 function getModelAgeDays(model: OpenRouterModel): number {
   if (!model.created) return Infinity;
   const now = Date.now();
@@ -72,19 +61,16 @@ function getModelAgeDays(model: OpenRouterModel): number {
   return Math.floor((now - createdMs) / (1000 * 60 * 60 * 24));
 }
 
-// Check if model is free
 function isFreeModel(model: OpenRouterModel): boolean {
   const promptPrice = parseFloat(model.pricing.prompt || '0');
   const completionPrice = parseFloat(model.pricing.completion || '0');
   return promptPrice === 0 && completionPrice === 0;
 }
 
-// Extract provider from model ID
 function getProvider(modelId: string): string {
   return modelId.split('/')[0]?.toLowerCase() || '';
 }
 
-// Get total price for scoring
 function getTotalPrice(model: OpenRouterModel): number {
   const promptPrice = parsePrice(model.pricing.prompt);
   const completionPrice = parsePrice(model.pricing.completion);
@@ -92,57 +78,72 @@ function getTotalPrice(model: OpenRouterModel): number {
 }
 
 // ============================================================================
-// Embedding Functions
+// Embedding Functions - Option 3: Name + Provider + Description + NL Capabilities
 // ============================================================================
 
-// Build rich embedding text for a model
+// Convert supported parameters to natural language
+function paramsToNaturalLanguage(params: string[] | undefined): string {
+  if (!params || params.length === 0) return '';
+
+  const capabilities: string[] = [];
+
+  if (params.includes('tools') || params.includes('tool_choice')) {
+    capabilities.push('tool use and function calling');
+  }
+  if (params.includes('response_format') || params.includes('structured_outputs')) {
+    capabilities.push('structured JSON output');
+  }
+  if (params.includes('reasoning')) {
+    capabilities.push('extended reasoning and chain-of-thought');
+  }
+  if (params.includes('temperature') || params.includes('top_p')) {
+    capabilities.push('adjustable creativity');
+  }
+
+  if (capabilities.length === 0) return '';
+  return `Good for ${capabilities.join(', ')}.`;
+}
+
+// Build embedding text: name + provider + description + natural language capabilities
 function buildEmbeddingText(model: OpenRouterModel): string {
   const provider = getProvider(model.id);
-  const params = model.supported_parameters?.join(', ') || 'none';
-  const modalities = parseModalities(model);
-  const inputMods = modalities.input.join(', ');
-  const outputMods = modalities.output.join(', ');
+  const description = model.description || '';
+  const capabilities = paramsToNaturalLanguage(model.supported_parameters);
 
-  // Create semantically rich text
   const parts = [
     model.name,
     `by ${provider}`,
-    model.description || '',
-    `Supports: ${params}`,
-    `Input: ${inputMods}`,
-    `Output: ${outputMods}`,
-    `Context: ${model.context_length} tokens`,
-  ];
+    description,
+    capabilities,
+  ].filter(Boolean);
 
-  return parts.filter(Boolean).join('. ');
+  return parts.join('. ');
 }
 
-// Ensure embeddings exist for all models, fetch missing ones
+// Ensure embeddings exist for all models
 async function ensureEmbeddings(
   models: OpenRouterModel[]
-): Promise<{ ok: true } | { ok: false; error: StructuredError }> {
+): Promise<{ embedded: number; failed: number; error?: string }> {
   if (!hasApiKey()) {
-    // No API key - skip embeddings, will use 0 for semantic score
-    return { ok: true };
+    return { embedded: 0, failed: 0, error: 'No API key - embeddings disabled' };
   }
 
   const cache = getEmbeddingsCache();
   const modelIds = models.map(m => m.id);
-
-  // Find models without embeddings
   const missingIds = modelIds.filter(id => !cache?.embeddings[id]);
+  const alreadyCached = modelIds.length - missingIds.length;
 
   if (missingIds.length === 0) {
-    return { ok: true };
+    return { embedded: alreadyCached, failed: 0 };
   }
 
-  // Build embedding texts for missing models
   const missingModels = models.filter(m => missingIds.includes(m.id));
   const texts = missingModels.map(m => buildEmbeddingText(m));
 
-  // Batch fetch embeddings (max 100 at a time to avoid API limits)
+  // Batch fetch embeddings (max 100 at a time)
   const BATCH_SIZE = 100;
   const newEmbeddings: Record<string, number[]> = {};
+  let fetchError: string | undefined;
 
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batchTexts = texts.slice(i, i + BATCH_SIZE);
@@ -150,9 +151,8 @@ async function ensureEmbeddings(
 
     const result = await getEmbeddings(batchTexts);
     if (!result.ok) {
-      // Embedding failed - continue without semantic scoring
-      console.error('Failed to fetch embeddings:', result.error);
-      return { ok: true }; // Don't fail the whole operation
+      fetchError = result.error.message;
+      continue; // Try remaining batches
     }
 
     for (let j = 0; j < batchIds.length; j++) {
@@ -160,137 +160,20 @@ async function ensureEmbeddings(
     }
   }
 
-  // Update cache
-  addEmbeddings(newEmbeddings);
-  return { ok: true };
-}
-
-// Get semantic similarity score between task and model
-async function getSemanticScore(
-  taskText: string,
-  modelId: string
-): Promise<number> {
-  if (!hasApiKey()) return 0;
-
-  const modelEmbedding = getModelEmbedding(modelId);
-  if (!modelEmbedding) return 0;
-
-  // Get task embedding
-  const result = await getEmbeddings([taskText]);
-  if (!result.ok || result.data.length === 0) return 0;
-
-  const taskEmbedding = result.data[0];
-  const similarity = cosineSimilarity(taskEmbedding, modelEmbedding);
-
-  // Normalize to 0-1 range (cosine similarity is -1 to 1)
-  return (similarity + 1) / 2;
-}
-
-// ============================================================================
-// Scoring Functions
-// ============================================================================
-
-// Calculate price score (0-1, lower price = higher score)
-function getPriceScore(model: OpenRouterModel, targetPrice?: { prompt_per_1m?: number; completion_per_1m?: number }): number {
-  const totalPrice = getTotalPrice(model);
-
-  if (totalPrice === 0) return 1; // Free is best for price
-  if (totalPrice === Infinity) return 0;
-
-  if (targetPrice) {
-    const targetTotal = (targetPrice.prompt_per_1m || 0) + (targetPrice.completion_per_1m || 0);
-    if (targetTotal > 0) {
-      // Score based on how close to target (or below)
-      if (totalPrice <= targetTotal) return 1;
-      // Gradual degradation up to 3x target price
-      const ratio = totalPrice / targetTotal;
-      return Math.max(0, 1 - (ratio - 1) / 2);
-    }
+  const newCount = Object.keys(newEmbeddings).length;
+  if (newCount > 0) {
+    addEmbeddings(newEmbeddings);
   }
-
-  // Default: score based on absolute price (cheaper = better)
-  // Assume $10/1M is "average", score degrades linearly
-  const avgPrice = 10;
-  if (totalPrice <= avgPrice) return 1;
-  return Math.max(0, 1 - (totalPrice - avgPrice) / (avgPrice * 10));
-}
-
-// Calculate parameter coverage score (0-1)
-function getParamScore(model: OpenRouterModel, requiredParams?: string[]): number {
-  if (!requiredParams || requiredParams.length === 0) return 1;
-  const supportedParams = new Set(model.supported_parameters || []);
-  const covered = requiredParams.filter(p => supportedParams.has(p)).length;
-  return covered / requiredParams.length;
-}
-
-// Calculate recency score (0-1, newer = higher if preferred)
-function getRecencyScore(model: OpenRouterModel, preferNewer: boolean, minAgeDays?: number): number {
-  const ageDays = getModelAgeDays(model);
-
-  if (ageDays === Infinity) return 0.5; // Unknown age = neutral
-
-  // If there's a minimum age preference, penalize newer models
-  if (minAgeDays !== undefined && ageDays < minAgeDays) {
-    // Soft penalty: linearly decrease score for models younger than minAgeDays
-    return Math.max(0.2, ageDays / minAgeDays);
-  }
-
-  if (preferNewer) {
-    // Newer is better: models < 30 days get 1.0, degrades over 2 years
-    if (ageDays <= 30) return 1;
-    return Math.max(0.3, 1 - (ageDays - 30) / 700);
-  } else {
-    // Older is better (more stable): models > 180 days get 1.0
-    if (ageDays >= 180) return 1;
-    return Math.max(0.5, ageDays / 180);
-  }
-}
-
-// Calculate context length score (0-1)
-function getContextScore(model: OpenRouterModel, targetContext?: number): number {
-  if (!targetContext) return 1; // No target = all equal
-
-  if (model.context_length >= targetContext) return 1;
-
-  // Soft penalty for not meeting target
-  return model.context_length / targetContext;
-}
-
-// Calculate total weighted score
-function calculateScore(
-  model: OpenRouterModel,
-  semanticScore: number,
-  spec: TaskSpec,
-  weights: ScoringWeights
-): ScoreBreakdown {
-  const priceScore = getPriceScore(model, spec.soft_constraints?.target_price);
-  const paramScore = getParamScore(model, spec.hard_constraints?.required_parameters);
-  const recencyScore = getRecencyScore(
-    model,
-    spec.preferences?.prefer_newer ?? true,
-    spec.soft_constraints?.min_age_days
-  );
-  const contextScore = getContextScore(model, spec.soft_constraints?.target_context_length);
-
-  const total =
-    weights.semantic * semanticScore +
-    weights.price * priceScore +
-    weights.parameters * paramScore +
-    weights.recency * recencyScore +
-    weights.context * contextScore;
 
   return {
-    semantic: semanticScore,
-    price: priceScore,
-    parameters: paramScore,
-    recency: recencyScore,
-    context: contextScore,
-    total,
+    embedded: alreadyCached + newCount,
+    failed: missingIds.length - newCount,
+    error: fetchError,
   };
 }
 
 // ============================================================================
-// Hard Constraints (True Dealbreakers Only)
+// Hard Constraints (Dealbreakers Only)
 // ============================================================================
 
 function meetsHardConstraints(
@@ -302,7 +185,7 @@ function meetsHardConstraints(
 
   const modalities = parseModalities(model);
 
-  // Check required parameters (dealbreaker - can't fake tool support)
+  // Required parameters
   if (constraints.required_parameters && constraints.required_parameters.length > 0) {
     const supportedParams = new Set(model.supported_parameters || []);
     const missingParams = constraints.required_parameters.filter(p => !supportedParams.has(p));
@@ -312,7 +195,7 @@ function meetsHardConstraints(
     }
   }
 
-  // Check input modalities (dealbreaker - can't process unsupported input)
+  // Input modalities
   if (constraints.input_modalities && constraints.input_modalities.length > 0) {
     const hasAllInputs = constraints.input_modalities.every(
       (m: Modality) => modalities.input.includes(m)
@@ -323,7 +206,7 @@ function meetsHardConstraints(
     }
   }
 
-  // Check output modalities (dealbreaker)
+  // Output modalities
   if (constraints.output_modalities && constraints.output_modalities.length > 0) {
     const hasAllOutputs = constraints.output_modalities.every(
       (m: Modality) => modalities.output.includes(m)
@@ -334,7 +217,7 @@ function meetsHardConstraints(
     }
   }
 
-  // Check provider whitelist (dealbreaker if specified)
+  // Provider whitelist
   if (constraints.providers && constraints.providers.length > 0) {
     const modelProvider = getProvider(model.id);
     const allowedProviders = constraints.providers.map(p => p.toLowerCase());
@@ -344,13 +227,53 @@ function meetsHardConstraints(
     }
   }
 
-  // Exclude free models (dealbreaker if specified)
+  // Exclude free models
   if (constraints.exclude_free && isFreeModel(model)) {
     exclusionReasons.set('free_model', (exclusionReasons.get('free_model') || 0) + 1);
     return false;
   }
 
+  // Max age filter (default 365 days)
+  const maxAgeDays = constraints.max_age_days ?? 365;
+  const modelAge = getModelAgeDays(model);
+  if (modelAge > maxAgeDays) {
+    exclusionReasons.set('too_old', (exclusionReasons.get('too_old') || 0) + 1);
+    return false;
+  }
+
+  // Max price filter
+  if (constraints.max_price_per_1m !== undefined) {
+    const totalPrice = getTotalPrice(model);
+    if (totalPrice > constraints.max_price_per_1m) {
+      exclusionReasons.set('too_expensive', (exclusionReasons.get('too_expensive') || 0) + 1);
+      return false;
+    }
+  }
+
   return true;
+}
+
+// ============================================================================
+// Secondary Sort (by routing preference)
+// ============================================================================
+
+function secondarySort(
+  models: Array<{ model: OpenRouterModel; semanticScore: number }>,
+  routing: 'price' | 'throughput' | 'latency'
+): void {
+  // Sort by semantic score first (descending), then by routing preference
+  models.sort((a, b) => {
+    // Primary: semantic score (descending)
+    const scoreDiff = b.semanticScore - a.semanticScore;
+    if (Math.abs(scoreDiff) > 0.01) return scoreDiff;
+
+    // Secondary: routing preference (for ties)
+    if (routing === 'price') {
+      return getTotalPrice(a.model) - getTotalPrice(b.model);
+    }
+    // Note: throughput/latency handled via provider.sort in skeleton
+    return 0;
+  });
 }
 
 // ============================================================================
@@ -379,38 +302,32 @@ function generateSkeleton(
     }
   }
 
-  const skeleton: RequestSkeleton = {
+  return {
     model: modelIdToUse,
     messages: [],
     provider: {
       require_parameters: true,
       allow_fallbacks: true,
+      sort: routing,
     },
   };
-
-  if (routing === 'throughput') {
-    skeleton.provider.sort = 'throughput';
-  } else if (routing === 'latency') {
-    skeleton.provider.sort = 'latency';
-  } else {
-    skeleton.provider.sort = 'price';
-  }
-
-  return skeleton;
 }
 
-function generateReasons(score: ScoreBreakdown, spec: TaskSpec): string[] {
+function generateReasons(semanticScore: number, model: OpenRouterModel): string[] {
   const reasons: string[] = [];
 
-  if (score.semantic >= 0.7) reasons.push('high semantic match');
-  if (score.parameters === 1) reasons.push('full param support');
-  if (score.price >= 0.8) reasons.push('good price');
-  if (score.context === 1 && spec.soft_constraints?.target_context_length) {
-    reasons.push(`context>=${spec.soft_constraints.target_context_length / 1000}k`);
+  if (semanticScore >= 0.8) {
+    reasons.push('excellent semantic match');
+  } else if (semanticScore >= 0.6) {
+    reasons.push('good semantic match');
   }
 
+  const params = model.supported_parameters || [];
+  if (params.includes('tools')) reasons.push('supports tools');
+  if (params.includes('reasoning')) reasons.push('supports reasoning');
+
   if (reasons.length === 0) {
-    reasons.push(`score: ${score.total.toFixed(2)}`);
+    reasons.push(`semantic: ${(semanticScore * 100).toFixed(0)}%`);
   }
 
   return reasons;
@@ -420,39 +337,23 @@ async function checkEndpoints(
   modelId: string,
   requiredParams: string[] | undefined,
   includeEndpoints: boolean
-): Promise<{ summary?: EndpointsSummary; risk?: string }> {
-  if (!includeEndpoints) {
-    return {};
-  }
+): Promise<{ summary?: EndpointsSummary }> {
+  if (!includeEndpoints) return {};
 
   const result = await getEndpoints(modelId);
-  if (!result.ok) {
-    return { risk: 'failed to fetch endpoints' };
-  }
-
-  const endpoints = result.data;
-  if (endpoints.length === 0) {
-    return { risk: 'no endpoints found' };
-  }
+  if (!result.ok || result.data.length === 0) return {};
 
   const summary: EndpointsSummary = {
-    count: endpoints.length,
-    endpoints: endpoints.map(ep => {
-      const supportsRequired = !requiredParams || requiredParams.length === 0 ||
-        requiredParams.every(p => (ep.supported_parameters || []).includes(p));
-      return {
-        name: ep.name,
-        supports_required_params: supportsRequired,
-        context_length: ep.context_length,
-      };
-    }),
+    count: result.data.length,
+    endpoints: result.data.map(ep => ({
+      name: ep.name,
+      supports_required_params: !requiredParams || requiredParams.length === 0 ||
+        requiredParams.every(p => (ep.supported_parameters || []).includes(p)),
+      context_length: ep.context_length,
+    })),
   };
 
-  const hasRisk = summary.endpoints.some(ep => !ep.supports_required_params);
-  return {
-    summary,
-    risk: hasRisk ? 'endpoint_param_risk' : undefined,
-  };
+  return { summary };
 }
 
 // ============================================================================
@@ -465,11 +366,10 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const includeEndpoints = spec.result?.include_endpoints ?? false;
   const includeRequestSkeleton = spec.result?.include_request_skeleton ?? false;
   const detailLevel = spec.result?.detail ?? 'minimal';
-  const useSemanticSearch = spec.preferences?.use_semantic_search ?? true;
-  const weights = { ...DEFAULT_WEIGHTS, ...spec.preferences?.scoring_weights };
+  const routing = spec.preferences?.routing ?? 'price';
   const requiredParams = spec.hard_constraints?.required_parameters;
 
-  // Freshness gate: ensure cache is valid
+  // Step 1: Ensure models cache is valid
   let cache = getModelsCache();
   let source: 'live' | 'cache' = 'cache';
 
@@ -496,51 +396,91 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const totalModels = allModels.length;
   const exclusionReasons = new Map<string, number>();
 
-  // Step 1: Hard constraint filtering (true dealbreakers only)
+  // Step 2: Hard constraint filtering
   const filtered = allModels.filter(model =>
     meetsHardConstraints(model, spec.hard_constraints, exclusionReasons)
   );
 
-  // Step 2: Ensure embeddings exist for filtered models
-  if (useSemanticSearch && hasApiKey()) {
-    await ensureEmbeddings(filtered);
-  }
+  // Step 3: Ensure embeddings exist
+  const keyStatus = getApiKeyStatus();
+  const embeddingStatus: EmbeddingStatus = {
+    enabled: keyStatus.valid,
+    api_key_status: keyStatus.format,
+    task_embedded: false,
+    models_embedded: 0,
+    models_failed: 0,
+  };
 
-  // Step 3: Get task embedding for semantic scoring
-  let taskEmbedding: number[] | null = null;
-  if (useSemanticSearch && hasApiKey()) {
-    const result = await getEmbeddings([spec.task]);
-    if (result.ok && result.data.length > 0) {
-      taskEmbedding = result.data[0];
+  if (keyStatus.valid) {
+    const modelEmbResult = await ensureEmbeddings(filtered);
+    embeddingStatus.models_embedded = modelEmbResult.embedded;
+    embeddingStatus.models_failed = modelEmbResult.failed;
+    if (modelEmbResult.error) {
+      embeddingStatus.error = modelEmbResult.error;
     }
   }
 
-  // Step 4: Score all models
+  // Step 4: Get task embedding
+  let taskEmbedding: number[] | null = null;
+  if (keyStatus.valid) {
+    const result = await getEmbeddings([spec.task]);
+    if (result.ok && result.data.length > 0) {
+      taskEmbedding = result.data[0];
+      embeddingStatus.task_embedded = true;
+    } else if (!result.ok) {
+      embeddingStatus.error = result.error.message;
+    }
+  }
+
+  // Step 5: Calculate semantic scores
   const scored = filtered.map(model => {
-    let semanticScore = 0;
+    let semanticScore = 0.5; // Default if no embedding
+
     if (taskEmbedding) {
       const modelEmbedding = getModelEmbedding(model.id);
       if (modelEmbedding) {
         const similarity = cosineSimilarity(taskEmbedding, modelEmbedding);
-        semanticScore = (similarity + 1) / 2; // Normalize to 0-1
+        semanticScore = (similarity + 1) / 2; // Normalize -1..1 to 0..1
       }
     }
 
-    const score = calculateScore(model, semanticScore, spec, weights);
-    return { model, score };
+    return { model, semanticScore };
   });
 
-  // Step 5: Sort by total score (descending)
-  scored.sort((a, b) => b.score.total - a.score.total);
+  // Step 6: Sort by semantic score + secondary routing preference
+  secondarySort(scored, routing);
 
-  // Step 6: Take top N
+  // Step 7: Take top N
   const shortlisted = scored.slice(0, limit);
 
-  // Step 7: Build result based on detail level
+  // Step 8: Build result based on detail level
+
+  // names_only: Ultra compact - just model IDs
+  if (detailLevel === 'names_only') {
+    const models = shortlisted.map(({ model }) => model.id);
+
+    // Calculate price range
+    const prices = shortlisted.map(({ model }) => getTotalPrice(model));
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const formatPrice = (p: number) => p < 1 ? `$${p.toFixed(2)}` : `$${p.toFixed(0)}`;
+    const priceRange = `${formatPrice(minPrice)}-${formatPrice(maxPrice)}/1M`;
+
+    const result: Task2ModelResultNamesOnly = {
+      task: spec.task,
+      models,
+      count: models.length,
+      price_range: priceRange,
+    };
+
+    return { ok: true, result };
+  }
+
+  // Other detail levels return full result with shortlist
   let shortlist: (ShortlistEntry | ShortlistEntryMinimal | OpenRouterModel)[];
 
   if (detailLevel === 'minimal') {
-    shortlist = shortlisted.map(({ model, score }) => {
+    shortlist = shortlisted.map(({ model, semanticScore }) => {
       const promptPrice = parseFloat(model.pricing.prompt || '0') * 1_000_000;
       const completionPrice = parseFloat(model.pricing.completion || '0') * 1_000_000;
       return {
@@ -550,7 +490,7 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
         context: model.context_length,
         supports: model.supported_parameters || [],
         age_days: getModelAgeDays(model),
-        score: score.total,
+        semantic_score: semanticScore,
       };
     });
   } else if (detailLevel === 'full') {
@@ -558,15 +498,10 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   } else {
     // Standard format
     shortlist = await Promise.all(
-      shortlisted.map(async ({ model, score }) => {
+      shortlisted.map(async ({ model, semanticScore }) => {
         const modalities = parseModalities(model);
-        const reasons = generateReasons(score, spec);
-        const risks: string[] = [];
-
+        const reasons = generateReasons(semanticScore, model);
         const endpointCheck = await checkEndpoints(model.id, requiredParams, includeEndpoints);
-        if (endpointCheck.risk) {
-          risks.push(endpointCheck.risk);
-        }
 
         const entry: ShortlistEntry = {
           model_id: model.id,
@@ -584,9 +519,8 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
             output: modalities.output,
           },
           supported_parameters: model.supported_parameters,
-          score,
+          semantic_score: semanticScore,
           why_selected: reasons,
-          risks: risks.length > 0 ? risks : undefined,
         };
 
         if (includeRequestSkeleton) {
@@ -616,12 +550,14 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
     auth_used: hasApiKey(),
   };
 
-  const result: Task2ModelResult = {
-    task: spec.task,
-    shortlist,
-    excluded_summary: excludedSummary,
-    catalog: catalogInfo,
+  return {
+    ok: true,
+    result: {
+      task: spec.task,
+      shortlist,
+      excluded_summary: excludedSummary,
+      catalog: catalogInfo,
+      embeddings: embeddingStatus,
+    },
   };
-
-  return { ok: true, result };
 }

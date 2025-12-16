@@ -1,10 +1,11 @@
 # openrouter-task2model
 
-An MCP (Model Context Protocol) Server that fetches the latest OpenRouter model catalog, filters models by declarative constraints (TaskSpec), and generates request skeletons for selected candidates.
+An MCP (Model Context Protocol) Server that fetches the latest OpenRouter model catalog, uses semantic search (embeddings) to find the best models for your task, and generates request skeletons.
 
 **Key Features:**
+- **Semantic Search:** Uses embeddings to match task descriptions to model capabilities
 - Real-time model catalog from OpenRouter API
-- Declarative constraint-based filtering (no AI summaries)
+- Declarative hard constraints for dealbreakers
 - Request skeleton generation with provider routing configuration
 - Freshness gate ensures you always work with up-to-date data
 
@@ -13,10 +14,10 @@ An MCP (Model Context Protocol) Server that fetches the latest OpenRouter model 
 ### Run with npx
 
 ```bash
-# Without API key (limited functionality)
+# Without API key (limited functionality, no semantic search)
 npx -y openrouter-task2model
 
-# With API key (recommended)
+# With API key (recommended - enables semantic search)
 OPENROUTER_API_KEY=sk-or-... npx -y openrouter-task2model
 ```
 
@@ -42,7 +43,7 @@ Add to your MCP configuration (e.g., Claude Desktop, Cursor, etc.):
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENROUTER_API_KEY` | No | OpenRouter API key. Enables access to all endpoints. |
+| `OPENROUTER_API_KEY` | Recommended | OpenRouter API key. Enables semantic search and all endpoints. |
 | `CACHE_TTL_MS` | No | Cache TTL in milliseconds (default: 600000 = 10 min) |
 | `CACHE_DIR` | No | Cache directory (default: `~/.cache/openrouter-task2model/`) |
 | `LOG_LEVEL` | No | Log level: `debug`, `info`, `warn`, `error` (default: `info`) |
@@ -63,7 +64,7 @@ Refresh the OpenRouter models catalog cache.
 **Output:**
 ```json
 {
-  "model_count": 250,
+  "model_count": 529,
   "fetched_at": "2025-01-15T10:30:00.000Z",
   "source": "live",
   "auth_used": true
@@ -77,7 +78,7 @@ Get detailed profile of a specific model.
 **Input:**
 ```json
 {
-  "model_id": "anthropic/claude-sonnet-4.5",
+  "model_id": "anthropic/claude-sonnet-4",
   "include_endpoints": true,
   "include_parameters": false
 }
@@ -87,8 +88,8 @@ Get detailed profile of a specific model.
 ```json
 {
   "model": {
-    "id": "anthropic/claude-sonnet-4.5",
-    "name": "Claude Sonnet 4.5",
+    "id": "anthropic/claude-sonnet-4",
+    "name": "Claude Sonnet 4",
     "context_length": 200000,
     "pricing": { "prompt": "0.000003", "completion": "0.000015" },
     "supported_parameters": ["tools", "tool_choice", "response_format", "reasoning"]
@@ -101,37 +102,26 @@ Get detailed profile of a specific model.
 
 ### 3. `task2model` (Main Tool)
 
-Recommend models based on task constraints. Returns top-K candidates with request skeletons.
+Recommend models based on task description using semantic search. Hard constraints filter out dealbreakers, then models are ranked by embedding similarity.
 
 **Input (TaskSpec):**
 ```json
 {
-  "task": "Build an agentic coding assistant with tool use",
+  "task": "Build an agentic coding assistant with tool use and image understanding",
   "hard_constraints": {
-    "min_context_length": 128000,
     "input_modalities": ["text", "image"],
     "output_modalities": ["text"],
-    "required_parameters": ["tools", "tool_choice", "response_format"],
-    "max_price": {
-      "prompt_per_1m": 5.0,
-      "completion_per_1m": 20.0
-    },
-    "min_age_days": 30,
+    "required_parameters": ["tools", "tool_choice"],
     "exclude_free": true,
-    "providers": ["anthropic", "openai", "google", "mistral", "deepseek"]
+    "providers": ["anthropic", "openai", "google"]
   },
   "preferences": {
-    "prefer_newer": true,
     "routing": "price",
-    "prefer_exacto_for_tools": true,
-    "top_provider_only": false
+    "prefer_exacto_for_tools": true
   },
   "result": {
-    "limit": 5,
-    "include_endpoints": false,
-    "include_parameters": false,
+    "limit": 10,
     "include_request_skeleton": true,
-    "force_refresh": false,
     "detail": "standard"
   }
 }
@@ -140,20 +130,21 @@ Recommend models based on task constraints. Returns top-K candidates with reques
 **Output (Task2ModelResult):**
 ```json
 {
-  "task": "Build an agentic coding assistant with tool use",
+  "task": "Build an agentic coding assistant with tool use and image understanding",
   "shortlist": [
     {
-      "model_id": "anthropic/claude-sonnet-4.5",
-      "name": "Claude Sonnet 4.5",
+      "model_id": "anthropic/claude-sonnet-4",
+      "name": "Claude Sonnet 4",
       "created": 1736899200,
       "context_length": 200000,
       "age_days": 45,
       "pricing": { "prompt": "0.000003", "completion": "0.000015" },
       "modalities": { "input": ["text", "image"], "output": ["text"] },
       "supported_parameters": ["tools", "tool_choice", "response_format", "reasoning"],
-      "why_selected": ["supports tools+tool_choice+response_format", "context>=128k", "within budget"],
+      "semantic_score": 0.847,
+      "why_selected": ["excellent semantic match", "supports tools", "supports reasoning"],
       "request_skeleton": {
-        "model": "anthropic/claude-sonnet-4.5:exacto",
+        "model": "anthropic/claude-sonnet-4:exacto",
         "messages": [],
         "provider": {
           "require_parameters": true,
@@ -164,14 +155,12 @@ Recommend models based on task constraints. Returns top-K candidates with reques
     }
   ],
   "excluded_summary": {
-    "total_models": 250,
-    "after_hard_filter": 15,
+    "total_models": 529,
+    "after_hard_filter": 45,
     "excluded_by": {
-      "missing_required_parameters": 180,
-      "context_too_small": 45,
-      "input_modality_mismatch": 10,
-      "too_new": 20,
-      "free_model": 15,
+      "missing_required_parameters": 380,
+      "input_modality_mismatch": 50,
+      "free_model": 24,
       "provider_not_allowed": 30
     }
   },
@@ -191,52 +180,48 @@ Recommend models based on task constraints. Returns top-K candidates with reques
 ```typescript
 type TaskSpec = {
   // Natural language task description (required)
+  // This is the main input for semantic search
   task: string;
 
-  // Hard constraints - models must satisfy ALL
+  // Hard constraints - models must satisfy ALL (dealbreakers only)
   hard_constraints?: {
-    min_context_length?: number;
+    required_parameters?: string[];  // e.g. ["tools", "tool_choice"]
     input_modalities?: Array<"text"|"image"|"audio"|"video">;
     output_modalities?: Array<"text"|"image"|"audio"|"video">;
-    required_parameters?: string[];  // e.g. ["tools", "tool_choice", "response_format"]
-    max_price?: {
-      prompt_per_1m?: number;      // USD per 1M tokens
-      completion_per_1m?: number;  // USD per 1M tokens
-      request?: number;            // USD per request
-    };
-    // Quality/reliability filters
-    min_age_days?: number;         // Exclude models newer than N days (filter untested)
-    exclude_free?: boolean;        // Skip $0 pricing models (often unreliable)
-    providers?: string[];          // Whitelist providers e.g. ["anthropic", "openai", "google"]
+    providers?: string[];          // Whitelist providers e.g. ["anthropic", "openai"]
+    exclude_free?: boolean;        // Skip $0 pricing models
   };
 
-  // Preferences - affect sorting
+  // Preferences - affect secondary sorting
   preferences?: {
-    prefer_newer?: boolean;              // default: true
     routing?: "price"|"throughput"|"latency";  // default: "price"
-    prefer_exacto_for_tools?: boolean;   // default: true
-    top_provider_only?: boolean;         // default: false
+    prefer_exacto_for_tools?: boolean;         // default: true
   };
 
   // Result configuration
   result?: {
-    limit?: number;                      // default: 50 (for initial scan)
+    limit?: number;                      // default: 50
     include_endpoints?: boolean;         // default: false
-    include_parameters?: boolean;        // default: false
     include_request_skeleton?: boolean;  // default: false
     force_refresh?: boolean;             // default: false
-    detail?: "minimal"|"standard"|"full"; // default: "minimal" - start with quick scan
+    detail?: "minimal"|"standard"|"full"; // default: "minimal"
   };
 };
 ```
+
+### How Ranking Works
+
+1. **Hard Constraints:** Filter out models that don't meet dealbreakers
+2. **Semantic Search:** Rank remaining models by embedding similarity to your task
+3. **Secondary Sort:** For models with similar semantic scores, sort by routing preference (price by default)
 
 ### Detail Levels
 
 | Level | Description |
 |-------|-------------|
-| `minimal` | ~8 lines per model: id, name, price, context, supports, age_days |
-| `standard` | ~25 lines: + modalities, why_selected, risks, request_skeleton |
-| `full` | ~180 lines: raw OpenRouter API response |
+| `minimal` | ~8 fields per model: id, name, price, context, supports, age_days, semantic_score |
+| `standard` | ~15 fields: + modalities, why_selected, request_skeleton, endpoints_summary |
+| `full` | Raw OpenRouter API response |
 
 **Minimal output example:**
 ```json
@@ -246,7 +231,8 @@ type TaskSpec = {
   "price": { "prompt": 0.30, "completion": 2.50 },
   "context": 1048576,
   "supports": ["tools", "structured_outputs"],
-  "age_days": 45
+  "age_days": 45,
+  "semantic_score": 0.823
 }
 ```
 
@@ -262,9 +248,20 @@ type TaskSpec = {
 | `temperature` | Sampling temperature |
 | `max_tokens` | Maximum completion tokens |
 
+## Semantic Search
+
+The server uses OpenRouter's embedding API (Qwen3-Embedding-8B) to match your task description against model capabilities. Each model is embedded using:
+- Model name
+- Provider name
+- Description
+- Natural language capabilities (e.g., "tool use and function calling", "structured JSON output")
+
+Embeddings are cached for 24 hours to minimize API calls.
+
 ## Caching & Freshness
 
-- **Default TTL:** 10 minutes
+- **Models TTL:** 10 minutes (configurable)
+- **Embeddings TTL:** 24 hours
 - **Force refresh:** Set `result.force_refresh: true` in TaskSpec
 - **Manual sync:** Use `sync_catalog` tool with `force: true`
 
@@ -274,7 +271,7 @@ Every `task2model` call includes catalog freshness info:
   "catalog": {
     "fetched_at": "2025-01-15T10:30:00.000Z",
     "cache_age_ms": 5000,
-    "source": "cache",  // or "live"
+    "source": "cache",
     "auth_used": true
   }
 }
@@ -286,7 +283,7 @@ The generated request skeleton is designed to be used directly with OpenRouter:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4.5:exacto",
+  "model": "anthropic/claude-sonnet-4:exacto",
   "messages": [],
   "provider": {
     "require_parameters": true,
