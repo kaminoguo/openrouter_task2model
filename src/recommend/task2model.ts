@@ -72,10 +72,15 @@ function getProvider(modelId: string): string {
   return modelId.split('/')[0]?.toLowerCase() || '';
 }
 
-function getTotalPrice(model: OpenRouterModel): number {
-  const promptPrice = parsePrice(model.pricing.prompt);
-  const completionPrice = parsePrice(model.pricing.completion);
-  return promptPrice + completionPrice;
+function getMaxPrice(model: OpenRouterModel): number {
+  const prices = [
+    parsePrice(model.pricing.prompt),
+    parsePrice(model.pricing.completion),
+    parsePrice(model.pricing.image),
+    parsePrice(model.pricing.request),
+  ].filter(p => p !== Infinity && p > 0);
+
+  return prices.length > 0 ? Math.max(...prices) : 0;
 }
 
 // ============================================================================
@@ -231,9 +236,9 @@ function meetsHardConstraints(
     return false;
   }
 
-  // Max price filter
+  // Max price filter (inclusive: <= max_price)
   if (constraints.max_price_per_1m !== undefined) {
-    const totalPrice = getTotalPrice(model);
+    const totalPrice = getMaxPrice(model);
     if (totalPrice > constraints.max_price_per_1m) {
       exclusionReasons.set('too_expensive', (exclusionReasons.get('too_expensive') || 0) + 1);
       return false;
@@ -259,7 +264,7 @@ function secondarySort(
 
     // Secondary: routing preference (for ties)
     if (routing === 'price') {
-      return getTotalPrice(a.model) - getTotalPrice(b.model);
+      return getMaxPrice(a.model) - getMaxPrice(b.model);
     }
     // Note: throughput/latency handled via provider.sort in skeleton
     return 0;
@@ -452,7 +457,7 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
     const models = shortlisted.map(({ model }) => model.id);
 
     // Calculate price range
-    const prices = shortlisted.map(({ model }) => getTotalPrice(model));
+    const prices = shortlisted.map(({ model }) => getMaxPrice(model));
     const minPrice = Math.min(...prices);
     const maxPrice = Math.max(...prices);
     const formatPrice = (p: number) => p < 1 ? `$${p.toFixed(2)}` : `$${p.toFixed(0)}`;
