@@ -1,7 +1,7 @@
 {
   "name": "openrouter-task2model",
-  "version": "1.4.2",
-  "description": "MCP Server for OpenRouter model selection - filters models by TaskSpec constraints and generates request skeletons",
+  "version": "1.4.3",
+  "description": "MCP Server to find the best AI model for your task. Searches 300+ OpenRouter models by semantic match and constraints.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

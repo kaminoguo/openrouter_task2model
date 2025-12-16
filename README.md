@@ -1,8 +1,16 @@
 # openrouter-task2model
 
-MCP Server for OpenRouter model discovery. Filters models by constraints and ranks by semantic similarity.
+MCP Server to find the best AI model for your task. Searches 300+ OpenRouter models.
 
 ## Installation
+
+### Claude Code
+
+```bash
+claude mcp add openrouter-task2model -e OPENROUTER_API_KEY=sk-or-... -- npx -y openrouter-task2model
+```
+
+### Manual Configuration
 
 ```json
 {
@@ -18,11 +26,19 @@ MCP Server for OpenRouter model discovery. Filters models by constraints and ran
 }
 ```
 
+## Design Philosophy
+
+**The AI decides which model to use, not the embeddings.**
+
+Semantic search narrows down 300+ models to ~100 candidates. From there, the AI uses its own knowledge to decide which models to benchmark. The ranking within those 100 is not a quality indicator - it just helps reduce the search space.
+
+Think of it as: embeddings filter, AI selects.
+
 ## Tools
 
 ### task2model
 
-Recommend models for a task. Returns top 100 model IDs by default.
+Find models for a task. Returns top 100 model IDs.
 
 ```json
 { "task": "Build a coding assistant with tool use" }
@@ -69,19 +85,16 @@ Refresh the model catalog cache.
 
 ## Known Limitations
 
-**Semantic ranking does NOT predict actual performance.**
+**Semantic ranking does NOT predict performance.**
 
-The ranking is based on embedding similarity between your task description and model descriptions. Model descriptions are marketing text, not benchmarks.
+The ranking is based on model descriptions (marketing text), not benchmarks. Example:
 
-Example from testing:
 | Model | Semantic Rank | Actual Performance |
 |-------|---------------|-------------------|
-| GPT-5.1-Codex-Mini | #6 | Poor (1-2 results) |
-| Gemini 2.5 Flash | #77 | Best (5 results, 8s) |
+| GPT-5.1-Codex-Mini | #6 | Poor |
+| Gemini 2.5 Flash | #77 | Best |
 
-"Codex" in the name matched "coding" semantically, but the model performed worse than Gemini which ranked much lower.
-
-**Use this tool for discovery, not selection.** Get a list of candidate models, then benchmark them yourself.
+However, both models are in the top 100 candidates. The AI can pick either one to test - **ranking within the 100 is not a quality signal**. The AI should use its own judgment to select from the pool.
 
 ## Environment Variables
 

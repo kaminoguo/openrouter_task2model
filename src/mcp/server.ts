@@ -22,7 +22,7 @@ import { log } from '../util/logger.js';
 const server = new McpServer(
   {
     name: 'openrouter-task2model',
-    version: '1.4.2',
+    version: '1.4.3',
   },
   {
     capabilities: {
