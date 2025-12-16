@@ -22,7 +22,7 @@ const PreferencesSchema = z.object({
 
 // Result configuration
 const ResultConfigSchema = z.object({
-  limit: z.number().int().positive().default(50),
+  limit: z.number().int().positive().default(100),
   include_endpoints: z.boolean().default(false),
   include_parameters: z.boolean().default(false),
   include_request_skeleton: z.boolean().default(false),
@@ -170,6 +170,7 @@ export interface Task2ModelResultNamesOnly {
   models: string[];  // Just model IDs
   count: number;
   price_range: string;  // e.g., "$0.10-$15.00/1M"
+  note: string;  // Disclaimer about ranking
 }
 
 // Result for other modes

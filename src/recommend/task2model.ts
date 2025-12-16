@@ -352,7 +352,7 @@ async function checkEndpoints(
 
 export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   const forceRefresh = spec.result?.force_refresh ?? false;
-  const limit = spec.result?.limit ?? 50;
+  const limit = spec.result?.limit ?? 100;
   const includeEndpoints = spec.result?.include_endpoints ?? false;
   const includeRequestSkeleton = spec.result?.include_request_skeleton ?? false;
   const detailLevel = spec.result?.detail ?? 'names_only';
@@ -364,10 +364,6 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
   let source: 'live' | 'cache' = 'cache';
 
   if (!isCacheValid(cache) || forceRefresh) {
-    // Clear embeddings too on force refresh (embedding text format may have changed)
-    if (forceRefresh) {
-      clearEmbeddingsCache();
-    }
     const modelsResult = await getModels();
     if (!modelsResult.ok) {
       return { ok: false, error: modelsResult.error };
@@ -395,7 +391,9 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
     meetsHardConstraints(model, spec.hard_constraints, exclusionReasons)
   );
 
-  // Step 3: Ensure embeddings exist
+  // Step 3: Generate fresh embeddings (no cache - always use latest format)
+  clearEmbeddingsCache();
+
   const keyStatus = getApiKeyStatus();
   const embeddingStatus: EmbeddingStatus = {
     enabled: keyStatus.valid,
@@ -465,6 +463,7 @@ export async function task2model(spec: TaskSpec): Promise<Task2ModelOutcome> {
       models,
       count: models.length,
       price_range: priceRange,
+      note: 'Ranked by description similarity. Does not predict actual task performance. Benchmark before production use.',
     };
 
     return { ok: true, result };
